@@ -1,0 +1,9 @@
+node_modules/
+.npm-cache/
+package-lock.json
+*.log
+.DS_Store
+AGENTS.md
+roadmap.md
+telegram.local.json
+state.json
