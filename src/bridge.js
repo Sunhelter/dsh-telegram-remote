@@ -19,6 +19,7 @@ const COMMANDS = [
   { command: 'sessions', description: '选择工作区和会话' },
   { command: 'new', description: '在新工作区新建会话' },
   { command: 'model', description: '切换模型' },
+  { command: 'status', description: '查看绑定状态' },
   { command: 'unbind', description: '解除会话绑定' },
   { command: 'help', description: '查看命令' },
 ]
@@ -1175,6 +1176,22 @@ export class Bridge {
       await this.showModels(api, chatId, undefined, { page: 0, refresh: true })
       return
     }
+    if (command === 'status') {
+      const binding = this.state.binding(chatId)
+      if (!binding) {
+        await this.reply(api, chatId, '现在没有绑定会话。发 /sessions 选一个。')
+        return
+      }
+      const menu = await loadCatalog(this.ctx)
+      const selection = await currentSelection(this.ctx, binding.sessionId)
+      const model = selection ? selectionLabel(selection, menu.ok ? menu.catalog : null) : '未知'
+      await this.reply(
+        api,
+        chatId,
+        `绑定会话：${binding.title || '未命名'}\n会话 ID：${binding.sessionId}\n工作区：${binding.workspaceTitle || '未知'}\n模型：${model}`,
+      )
+      return
+    }
     if (command === 'unbind') {
       const binding = this.dropBinding(chatId)
       if (!binding) {
@@ -1185,7 +1202,7 @@ export class Bridge {
       return
     }
     if (command === 'help') {
-      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/new 在新工作区新建会话\n/model 切换模型\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
+      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/new 在新工作区新建会话\n/model 切换模型\n/status 查看绑定状态\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到已绑定的会话')
       return
     }
     await this.reply(api, chatId, `还不认识 /${command}，发 /help 看现有命令。`)

@@ -23,6 +23,12 @@ export class TelegramApi {
     this.controllers = new Set()
   }
 
+  /** Keep the bot token out of anything that may be logged or shown back. */
+  scrub(value) {
+    const text = String(value ?? '')
+    return this.token ? text.split(this.token).join('<token>') : text
+  }
+
   async call(method, params = {}, { timeoutMs = this.timeoutMs } = {}) {
     const url = `https://api.telegram.org/bot${this.token}/${method}`
     const controller = new AbortController()
@@ -38,6 +44,9 @@ export class TelegramApi {
         proxy: this.proxy,
         signal: controller.signal,
       })
+    } catch (error) {
+      if (error instanceof Error) error.message = this.scrub(error.message)
+      throw error
     } finally {
       this.controllers.delete(controller)
     }
@@ -46,15 +55,18 @@ export class TelegramApi {
     try {
       data = JSON.parse(res.body)
     } catch {
-      throw new TelegramError(`Telegram API ${method}: HTTP ${res.status} ${res.body.slice(0, PREVIEW_LIMIT)}`, {
-        method,
-        status: res.status,
-      })
+      throw new TelegramError(
+        this.scrub(`Telegram API ${method}: HTTP ${res.status} ${res.body.slice(0, PREVIEW_LIMIT)}`),
+        {
+          method,
+          status: res.status,
+        },
+      )
     }
 
     if (!data.ok) {
       throw new TelegramError(
-        `Telegram API ${method}: ${data.description ?? `HTTP ${res.status}`}${data.error_code ? ` (${data.error_code})` : ''}`,
+        this.scrub(`Telegram API ${method}: ${data.description ?? `HTTP ${res.status}`}${data.error_code ? ` (${data.error_code})` : ''}`),
         {
           method,
           status: res.status,
