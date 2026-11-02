@@ -7,6 +7,7 @@
  * same-origin routes, never over a direct Host service call.
  */
 import { maskToken, resolveConfig, saveLocalConfig } from './src/config.js'
+import { createLog, logSnapshot } from './src/logbuffer.js'
 import { Bridge } from './src/bridge.js'
 
 export const name = 'telegram-remote'
@@ -15,6 +16,9 @@ export const inject = ['agents', 'webServer']
 
 /** Same-origin endpoint the settings page reads and writes. */
 const CONFIG_PATH = '/plugins/telegram-remote/config'
+
+/** Same-origin endpoint the settings page polls for the log window. */
+const LOGS_PATH = '/plugins/telegram-remote/logs'
 
 const MAX_BODY_BYTES = 16 * 1024
 
@@ -107,6 +111,7 @@ export function apply(ctx, config) {
   const rowConfig = config ?? {}
   let resolved = resolveConfig(rowConfig)
   const bridge = new Bridge(ctx, resolved)
+  const log = createLog(ctx)
   // Agents owned by the Web app live outside this plugin's scope; global
   // listeners are required to mirror their streams and session events.
   ctx.on('agent/assistant-stream', (payload) => bridge.onAssistantStream(payload), { global: true })
@@ -130,9 +135,9 @@ export function apply(ctx, config) {
     // finds the bot drive this machine, so it counts as "not configured".
     // `start` itself refuses in that case and records why for the settings page.
     if (!resolved.token) {
-      ctx.logger.warn('telegram-remote: no bot token yet; add one in Settings > Telegram 遥控')
+      log.warn('telegram-remote: no bot token yet; add one in Settings > Telegram 遥控')
     } else if (resolved.allowedUserIds.length === 0) {
-      ctx.logger.warn('telegram-remote: no allowed user id yet; add one in Settings > Telegram 遥控')
+      log.warn('telegram-remote: no allowed user id yet; add one in Settings > Telegram 遥控')
     }
     bridge.start()
     return () => bridge.stop()
@@ -177,7 +182,7 @@ export function apply(ctx, config) {
             saveLocalConfig(patch)
             resolved = resolveConfig(rowConfig)
             bridge.restart(resolved)
-            ctx.logger.info(`telegram-remote: config saved from settings page (token ${maskToken(resolved.token) || 'none'})`)
+            log.info(`telegram-remote: config saved from settings page (token ${maskToken(resolved.token) || 'none'})`)
             sendJson(res, 200, snapshot())
           } catch (error) {
             sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : '保存配置失败' })
@@ -185,5 +190,25 @@ export function apply(ctx, config) {
         },
       }),
     'telegram-remote: config route',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: LOGS_PATH,
+        handler: (req, res) => {
+          if (rejectUntrusted(ctx, req, res)) return
+          if (req.method !== 'GET') {
+            res.writeHead(405, { allow: 'GET' })
+            res.end()
+            return
+          }
+          const requested = Number.parseInt(new URL(req.url ?? LOGS_PATH, 'http://localhost').searchParams.get('after') ?? '', 10)
+          const after = Number.isFinite(requested) ? Math.max(0, requested) : 0
+          sendJson(res, 200, { ok: true, ...logSnapshot({ after }) })
+        },
+      }),
+    'telegram-remote: logs route',
   )
 }

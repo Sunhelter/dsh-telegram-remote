@@ -8,6 +8,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { STATE_PATH, maskToken } from './config.js'
+import { createLog } from './logbuffer.js'
 import { currentSelection, loadCatalog, modelItems, modelView, selectionFor, selectionLabel } from './models.js'
 import { ReplyOutbox } from './outbox.js'
 import { blankSessionIn, listWorkspaces, sessionView, truncate, workspaceView } from './sessions.js'
@@ -77,7 +78,7 @@ function busyBehavior(ctx) {
     const form = ctx.get('settings')?.describe?.().find((row) => row.ns === 'ui-conversation')
     return form?.value?.busyEnter === 'steer' ? 'steer' : 'queue'
   } catch (error) {
-    ctx.logger?.warn(`telegram-remote: cannot read the busy-enter setting: ${error.message}`)
+    createLog(ctx).warn(`telegram-remote: cannot read the busy-enter setting: ${error.message}`)
     return 'queue'
   }
 }
@@ -93,7 +94,7 @@ function defaultAgentOptions(ctx) {
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
     }
   } catch (error) {
-    ctx.logger?.warn(`telegram-remote: cannot read the default model: ${error.message}`)
+    createLog(ctx).warn(`telegram-remote: cannot read the default model: ${error.message}`)
     return undefined
   }
 }
@@ -104,6 +105,7 @@ const isConflict = (error) => error?.status === 409 || error?.code === 409
 export class Bridge {
   constructor(ctx, config) {
     this.ctx = ctx
+    this.log = createLog(ctx)
     this.config = config
     this.api = null
     this.state = new StateStore(STATE_PATH)
@@ -119,6 +121,8 @@ export class Bridge {
     this.modelMenus = new Map()
     /** Turn number per session, from `turn/start`. */
     this.currentTurns = new Map()
+    /** Session -> wall clock of its current turn, for the log window. */
+    this.turnStarted = new Map()
     /** Session -> turn that was started by a scheduled message. */
     this.scheduleTurns = new Map()
     /** Session -> `{ turn, chats, started }` for a scheduled turn that is
@@ -144,7 +148,7 @@ export class Bridge {
     this.status = { running: true, bot: null, error: null, offset: this.state.offset }
 
     const route = this.config.proxy ? `via ${this.config.proxy}` : 'direct'
-    this.ctx.logger.info(`telegram-remote: starting (token ${maskToken(this.config.token)}, ${route}, offset ${this.state.offset})`)
+    this.log.info(`telegram-remote: starting (token ${maskToken(this.config.token)}, ${route}, offset ${this.state.offset})`)
     void this.run(api)
   }
 
@@ -160,6 +164,7 @@ export class Bridge {
     this.statuses.clear()
     this.modelMenus.clear()
     this.currentTurns.clear()
+    this.turnStarted.clear()
     this.scheduleTurns.clear()
     this.pushes.clear()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
@@ -180,7 +185,7 @@ export class Bridge {
       await api.setMyCommands(COMMANDS)
     } catch (error) {
       if (this.api !== api) return
-      this.ctx.logger.warn(`telegram-remote: cannot register command menu: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot register command menu: ${error.message}`)
     }
 
     let backoff = BACKOFF_START_MS
@@ -208,7 +213,7 @@ export class Bridge {
           await this.handleUpdate(api, update)
         } catch (error) {
           if (this.api !== api) return
-          this.ctx.logger.warn(`telegram-remote: update ${update.update_id} failed: ${error.message}`)
+          this.log.warn(`telegram-remote: update ${update.update_id} failed: ${error.message}`)
         }
         this.state.offset = update.update_id
         this.state.save()
@@ -223,24 +228,24 @@ export class Bridge {
 
     if (isUnauthorized(error)) {
       this.status.running = false
-      this.ctx.logger.error(`telegram-remote: bot token rejected: ${error.message}`)
+      this.log.error(`telegram-remote: bot token rejected: ${error.message}`)
       return false
     }
 
     if (isConflict(error)) {
       this.status.running = false
-      this.ctx.logger.error('telegram-remote: another process is polling this bot (getUpdates 409); stop it first')
+      this.log.error('telegram-remote: another process is polling this bot (getUpdates 409); stop it first')
       return false
     }
 
     if (error.code === 429) {
       const wait = Math.max(1, Number(error.retryAfter) || 1)
-      this.ctx.logger.warn(`telegram-remote: rate limited, retrying in ${wait}s`)
+      this.log.warn(`telegram-remote: rate limited, retrying in ${wait}s`)
       await sleep(wait * 1000)
       return this.api === api
     }
 
-    this.ctx.logger.warn(`telegram-remote: polling failed, retrying in ${Math.round(backoff / 1000)}s: ${error.message}`)
+    this.log.warn(`telegram-remote: polling failed, retrying in ${Math.round(backoff / 1000)}s: ${error.message}`)
     await sleep(backoff)
     return this.api === api
   }
@@ -251,11 +256,11 @@ export class Bridge {
       if (this.api !== api) return
       this.status.bot = me.username ? `@${me.username}` : String(me.first_name ?? me.id)
       this.status.error = null
-      this.ctx.logger.info(`telegram-remote: connected as ${this.status.bot} (${me.id})`)
+      this.log.info(`telegram-remote: connected as ${this.status.bot} (${me.id})`)
     } catch (error) {
       if (this.api !== api) return
       this.status.error = error.message
-      this.ctx.logger.warn(`telegram-remote: cannot reach Bot API: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot reach Bot API: ${error.message}`)
     }
   }
 
@@ -362,7 +367,7 @@ export class Bridge {
     try {
       this.state.save()
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: cannot save unbind: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot save unbind: ${error.message}`)
     }
     return binding
   }
@@ -397,9 +402,9 @@ export class Bridge {
         const handle = await agents.resume({ resumeSessionId: binding.sessionId, agentOptions: defaultAgentOptions(this.ctx) })
         this.handles.set(binding.sessionId, handle)
         agent = handle.agent
-        this.ctx.logger.info(`telegram-remote: resumed ${binding.sessionId} to send a message`)
+        this.log.info(`telegram-remote: resumed ${binding.sessionId} to send a message`)
       } catch (error) {
-        this.ctx.logger.warn(`telegram-remote: cannot resume ${binding.sessionId}: ${error.message}`)
+        this.log.warn(`telegram-remote: cannot resume ${binding.sessionId}: ${error.message}`)
         await this.reply(api, chatId, `恢复会话失败：${error.message}`)
         return
       }
@@ -411,7 +416,7 @@ export class Bridge {
       if (behavior === 'steer') agent.steer(message)
       else agent.followup(message)
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: ${behavior} on ${binding.sessionId} failed: ${error.message}`)
+      this.log.warn(`telegram-remote: ${behavior} on ${binding.sessionId} failed: ${error.message}`)
       await this.reply(api, chatId, `发送失败：${error.message}`)
       return
     }
@@ -451,6 +456,7 @@ export class Bridge {
       // A push whose turn never closed must not leak into the next turn.
       this.pushes.delete(sessionId)
       this.currentTurns.set(sessionId, data?.turn)
+      if (this.chatsBoundTo(sessionId).length > 0) this.turnStarted.set(sessionId, Date.now())
     } else if (type === 'user/message' && data?.source?.kind === 'schedule') {
       this.noteScheduledTurn(sessionId)
     }
@@ -481,7 +487,16 @@ export class Bridge {
       }
     }
 
-    if (type === 'turn/end') this.endTurn(sessionId, data?.turn)
+    if (type === 'turn/end') {
+      const started = this.turnStarted.get(sessionId)
+      if (started !== undefined) {
+        this.turnStarted.delete(sessionId)
+        this.log.info(
+          `回合结束：${this.sessionLabel(sessionId)}，${data?.reason?.kind ?? 'unknown'}，用时 ${formatDuration(Date.now() - started)}`,
+        )
+      }
+      this.endTurn(sessionId, data?.turn)
+    }
   }
 
   /** A scheduled message entered the session; remember it and its push targets. */
@@ -603,7 +618,7 @@ export class Bridge {
       } else if (error.code === 429) {
         // Rate limited: keep the message and retry on the next tick.
       } else {
-        this.ctx.logger.warn(`telegram-remote: status update for ${chatId} failed: ${error.message}`)
+        this.log.warn(`telegram-remote: status update for ${chatId} failed: ${error.message}`)
         status.messageId = null
         status.sent = ''
       }
@@ -671,6 +686,15 @@ export class Bridge {
     return chats
   }
 
+  /** Session title for log lines; falls back to the short id. */
+  sessionLabel(sessionId) {
+    for (const chatId of this.chatsBoundTo(sessionId)) {
+      const title = this.state.binding(chatId)?.title
+      if (title) return title
+    }
+    return sessionId.slice(-8)
+  }
+
   /** Every chat that should receive this session's live output right now. */
   chatsBoundTo(sessionId) {
     const chats = new Set(this.boundChatsTo(sessionId))
@@ -707,7 +731,7 @@ export class Bridge {
           prefix: '🐳 ',
           sendText: (text) => this.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
           editText: (messageId, text) => this.api.editMessageText(chatId, messageId, text, { disable_web_page_preview: true }),
-          log: (line) => this.ctx.logger.warn(line),
+          log: (line) => this.log.warn(line),
         }),
         lastAt: 0,
         timer: null,
@@ -785,7 +809,7 @@ export class Bridge {
       stream.lastAt = Date.now()
     } catch (error) {
       if (this.api !== api) return
-      this.ctx.logger.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
+      this.log.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
     } finally {
       stream.busy = false
       if (stream.dirty && !stream.ending) {
@@ -818,7 +842,7 @@ export class Bridge {
     try {
       await stream.outbox.close(abandoned ? '\n\n（已中断）' : '')
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
+      this.log.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
     }
     if (stream.pushed) await this.finishPush(stream.sessionId, chatId)
   }
@@ -902,10 +926,10 @@ export class Bridge {
       try {
         const handle = await agents.resume({ resumeSessionId: sessionId, agentOptions: defaultAgentOptions(this.ctx) })
         this.handles.set(sessionId, handle)
-        this.ctx.logger.info(`telegram-remote: resumed ${sessionId} for chat ${chatId}`)
+        this.log.info(`telegram-remote: resumed ${sessionId} for chat ${chatId}`)
       } catch (error) {
         if (!agents.get(sessionId)) {
-          this.ctx.logger.warn(`telegram-remote: cannot resume ${sessionId}: ${error.message}`)
+          this.log.warn(`telegram-remote: cannot resume ${sessionId}: ${error.message}`)
           await this.reply(api, chatId, `恢复会话失败：${error.message}`)
           return
         }
@@ -940,7 +964,7 @@ export class Bridge {
     try {
       this.state.save()
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: cannot save binding: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot save binding: ${error.message}`)
     }
 
     const catalog = (await loadCatalog(this.ctx)).catalog
@@ -991,7 +1015,7 @@ export class Bridge {
         ...(blank ? { sessionId: blank } : {}),
       })
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: cannot create a session in ${workspace.path}: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot create a session in ${workspace.path}: ${error.message}`)
       await this.answer(api, query.id, '新建失败')
       await this.reply(api, chatId, `新建会话失败：${errorText(error)}`)
       return
@@ -1004,7 +1028,7 @@ export class Bridge {
       return
     }
 
-    this.ctx.logger.info(`telegram-remote: ${sessionId === blank ? 'reused blank' : 'created'} ${sessionId} in ${workspace.path} for chat ${chatId}`)
+    this.log.info(`telegram-remote: ${sessionId === blank ? 'reused blank' : 'created'} ${sessionId} in ${workspace.path} for chat ${chatId}`)
 
     await this.answer(api, query.id, '已新建')
     await this.applyBinding(api, chatId, query.message?.message_id, {
@@ -1072,7 +1096,7 @@ export class Bridge {
       const value = await controller.selectModel({ sessionId: binding.sessionId, ...picked })
       if (value?.selected) selected = value.selected
     } catch (error) {
-      this.ctx.logger.warn(`telegram-remote: cannot switch model on ${binding.sessionId}: ${error.message}`)
+      this.log.warn(`telegram-remote: cannot switch model on ${binding.sessionId}: ${error.message}`)
       await this.answer(api, query.id, `切换失败：${error.message}`)
       return
     }
@@ -1128,7 +1152,7 @@ export class Bridge {
       await api.answerCallbackQuery(id, text)
     } catch (error) {
       if (this.api !== api) return
-      this.ctx.logger.warn(`telegram-remote: answerCallbackQuery failed: ${error.message}`)
+      this.log.warn(`telegram-remote: answerCallbackQuery failed: ${error.message}`)
     }
   }
 
@@ -1138,12 +1162,14 @@ export class Bridge {
     if (typeof chatId !== 'number') return
 
     if (typeof userId !== 'number' || !this.isAllowed(userId)) {
+      this.log.warn(`忽略未授权消息：user ${userId ?? '未知'}，chat ${chatId}`)
       await this.reject(api, chatId)
       return
     }
 
     const text = typeof message.text === 'string' ? message.text.trim() : ''
     if (!text.startsWith('/')) {
+      this.log.info(`收到文本：user ${userId}，chat ${chatId}，${text.length} 字`)
       const stale = await this.pruneBinding(chatId)
       if (stale) {
         await this.reply(api, chatId, `之前绑定的「${stale.title || '未命名'}」已经不在了，已解除绑定。发 /sessions 重新选。`)
@@ -1160,6 +1186,7 @@ export class Bridge {
 
     const [head] = text.split(/\s+/)
     const command = head.slice(1).split('@')[0].toLowerCase()
+    this.log.info(`收到命令 /${command}：user ${userId}，chat ${chatId}`)
     if (command === 'start') {
       await this.reply(api, chatId, '已连上。发 /sessions 选工作区和会话。')
       return
@@ -1226,7 +1253,7 @@ export class Bridge {
       await api.sendMessage(chatId, text, extra)
     } catch (error) {
       if (this.api !== api) return
-      this.ctx.logger.warn(`telegram-remote: sendMessage to ${chatId} failed: ${error.message}`)
+      this.log.warn(`telegram-remote: sendMessage to ${chatId} failed: ${error.message}`)
     }
   }
 }

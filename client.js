@@ -18,6 +18,72 @@ window.__ModuleLoader__.load({
 
 		const NS = 'telegramRemote'
 		const CONFIG_PATH = '/plugins/telegram-remote/config'
+		const LOGS_PATH = '/plugins/telegram-remote/logs'
+
+		const NAV_ICON_MARKER = 'data-telegram-remote-nav-icon'
+		const NAV_ROW_SELECTOR = '[role="dialog"] nav button'
+		const NAV_ICON_URL =
+			'data:image/svg+xml,' +
+			encodeURIComponent(
+				'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#000"><g transform="translate(12 12) scale(0.4668) translate(-25.15 -37.9)"><path d="M43.8 20.8 C44.8 20.3 45.8 21.1 45.5 22.2 L39.8 51.9 C39.4 54.1 37.8 54.8 35.9 53.7 L24.1 46.4 C22.6 45.5 22.5 44.2 23.8 43.1 L37.9 29.4 C38.7 28.7 37.8 28.4 37.0 29.0 L16.8 41.7 C15.5 42.5 14.2 42.7 12.7 42.2 L6.6 40.2 C4.8 39.6 4.8 38.4 6.8 37.5 Z"/><circle cx="18" cy="50" r="5.5" fill-opacity="0.5"/></g></svg>',
+			)
+
+		/** Swap the section row's default gear for a paper plane with a dot. */
+		function installNavIcon(ctx, resolveLabel) {
+			if (typeof document === 'undefined') return
+			ctx.effect(() => {
+				const style = document.createElement('style')
+				style.dataset.plugin = 'telegram-remote'
+				style.dataset.pluginCss = 'telegram-remote/settings-nav-icon'
+				style.textContent = [
+					`[${NAV_ICON_MARKER}] > svg { display: none; }`,
+					`[${NAV_ICON_MARKER}]::before {`,
+					`  content: '';`,
+					`  flex: none;`,
+					`  width: 16px;`,
+					`  height: 16px;`,
+					`  background-color: currentColor;`,
+					`  -webkit-mask-image: url("${NAV_ICON_URL}");`,
+					`  mask-image: url("${NAV_ICON_URL}");`,
+					`  -webkit-mask-repeat: no-repeat;`,
+					`  mask-repeat: no-repeat;`,
+					`  -webkit-mask-position: center;`,
+					`  mask-position: center;`,
+					`  -webkit-mask-size: 16px 16px;`,
+					`  mask-size: 16px 16px;`,
+					`}`,
+				].join('\n')
+				document.head.appendChild(style)
+				let disposed = false
+				let scheduled = false
+				const sync = () => {
+					scheduled = false
+					if (disposed) return
+					const wanted = String(resolveLabel() ?? '').trim()
+					if (!wanted) return
+					for (const row of document.querySelectorAll(NAV_ROW_SELECTOR)) {
+						if (row.textContent.trim() === wanted) row.setAttribute(NAV_ICON_MARKER, '')
+						else row.removeAttribute(NAV_ICON_MARKER)
+					}
+				}
+				const schedule = () => {
+					if (scheduled || disposed) return
+					scheduled = true
+					queueMicrotask(sync)
+				}
+				sync()
+				const observer = new MutationObserver(schedule)
+				observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+				return () => {
+					disposed = true
+					observer.disconnect()
+					for (const row of document.querySelectorAll(`[${NAV_ICON_MARKER}]`)) {
+						row.removeAttribute(NAV_ICON_MARKER)
+					}
+					style.remove()
+				}
+			}, 'telegram-remote: settings nav icon')
+		}
 
 		const zh = {
 			nav: 'Telegram 遥控',
@@ -49,6 +115,11 @@ window.__ModuleLoader__.load({
 			retry: '重试',
 			hint: 'Token 在 @BotFather 创建 bot 后拿到；自己的数字 ID 发给 @userinfobot 就能查到。',
 			badRequest: '请求失败',
+			logTitle: '日志',
+			logHint: '只显示本插件的日志，保留最近 200 条。',
+			logEmpty: '暂无日志。',
+			logClear: '清空',
+			logFailed: '日志读取失败：{error}',
 		}
 
 		const en = {
@@ -81,6 +152,11 @@ window.__ModuleLoader__.load({
 			retry: 'Retry',
 			hint: 'Create a bot with @BotFather to get a token; send a message to @userinfobot to read your numeric id.',
 			badRequest: 'Request failed',
+			logTitle: 'Logs',
+			logHint: 'This plugin only; the latest 200 lines are kept.',
+			logEmpty: 'No logs yet.',
+			logClear: 'Clear',
+			logFailed: 'Cannot load logs: {error}',
 		}
 
 		const CSS = `
@@ -105,6 +181,15 @@ window.__ModuleLoader__.load({
 .tg-remote-notice { font-size: 13px; line-height: 1.5; }
 .tg-remote-notice.is-ok { color: var(--dsw-alias-state-success-primary); }
 .tg-remote-notice.is-err { color: var(--dsw-alias-state-error-primary); }
+.tg-remote-logs { gap: 10px; }
+.tg-remote-logs-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.tg-remote-logbox { max-height: 260px; min-height: 90px; overflow: auto; padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; }
+.tg-remote-logline { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tg-remote-logline.is-warn { color: var(--dsw-alias-state-warning-primary, #b26b00); }
+.tg-remote-logline.is-error { color: var(--dsw-alias-state-error-primary); }
+.tg-remote-logtime { opacity: 0.7; margin-right: 8px; }
+.tg-remote-button.is-ghost { color: var(--dsw-alias-label-primary); background: transparent; border: 1px solid var(--dsw-alias-border-l1); }
+.tg-remote-button.is-ghost:hover:not(:disabled) { background-color: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05)); background-image: none; }
 `
 
 		function call(payload) {
@@ -152,6 +237,11 @@ window.__ModuleLoader__.load({
 			const [form, setForm] = React.useState({ token: '', allowed: '', proxy: '', timeout: '30' })
 			const [saving, setSaving] = React.useState(false)
 			const [notice, setNotice] = React.useState(null)
+			const [logs, setLogs] = React.useState([])
+			const [logError, setLogError] = React.useState(null)
+			const logSeq = React.useRef(0)
+			const logBox = React.useRef(null)
+			const stickToBottom = React.useRef(true)
 
 			const adopt = React.useCallback((payload) => {
 				setData(payload)
@@ -178,6 +268,51 @@ window.__ModuleLoader__.load({
 			React.useEffect(() => {
 				load()
 			}, [load])
+
+			React.useEffect(() => {
+				let stopped = false
+				const poll = () => {
+					fetch(`${LOGS_PATH}?after=${logSeq.current}`, { credentials: 'same-origin' })
+						.then((response) =>
+							response
+								.json()
+								.catch(() => ({ ok: false, error: `HTTP ${response.status}` })),
+						)
+						.catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+						.then((payload) => {
+							if (stopped) return
+							if (!payload?.ok) {
+								setLogError(payload?.error ?? t('badRequest'))
+								return
+							}
+							setLogError(null)
+							logSeq.current = payload.seq ?? logSeq.current
+							if (Array.isArray(payload.entries) && payload.entries.length > 0) {
+								setLogs((current) => {
+									const last = current.length > 0 ? current[current.length - 1].seq : 0
+									const fresh = payload.entries.filter((entry) => entry.seq > last)
+									if (fresh.length === 0) return current
+									return [...current, ...fresh].slice(-400)
+								})
+							}
+						})
+				}
+				poll()
+				const timer = setInterval(poll, 1500)
+				return () => {
+					stopped = true
+					clearInterval(timer)
+				}
+			}, [t])
+
+			React.useEffect(() => {
+				const box = logBox.current
+				if (box && stickToBottom.current) box.scrollTop = box.scrollHeight
+			}, [logs])
+
+			const clearLogs = () => {
+				setLogs([])
+			}
 
 			const submit = (event) => {
 				event.preventDefault()
@@ -295,6 +430,52 @@ window.__ModuleLoader__.load({
 					),
 					notice ? h('div', { className: `tg-remote-notice is-${notice.kind}` }, notice.text) : null,
 				),
+				h(
+					'div',
+					{ className: 'tg-remote-card tg-remote-logs' },
+					h(
+						'div',
+						{ className: 'tg-remote-logs-head' },
+						h(
+							'div',
+							null,
+							h('div', { className: 'tg-remote-label' }, t('logTitle')),
+							h(
+								'div',
+								{ className: 'tg-remote-hint' },
+								logError ? t('logFailed', { error: logError }) : t('logHint'),
+							),
+						),
+						logs.length > 0
+							? h(
+									'button',
+									{ className: 'tg-remote-button is-ghost', type: 'button', onClick: clearLogs },
+									t('logClear'),
+								)
+							: null,
+					),
+					h(
+						'div',
+						{
+							className: 'tg-remote-logbox',
+							ref: logBox,
+							onScroll: (event) => {
+								const box = event.currentTarget
+								stickToBottom.current = box.scrollHeight - box.scrollTop - box.clientHeight < 40
+							},
+						},
+						logs.length === 0
+							? h('div', { className: 'tg-remote-logline' }, t('logEmpty'))
+							: logs.map((entry) =>
+									h(
+										'span',
+										{ key: entry.seq, className: `tg-remote-logline is-${entry.level}` },
+										h('span', { className: 'tg-remote-logtime' }, new Date(entry.at).toLocaleTimeString()),
+										entry.message,
+									),
+								),
+					),
+				),
 			)
 		}
 
@@ -314,6 +495,7 @@ window.__ModuleLoader__.load({
 			}, 'telegram-remote: styles')
 
 			const t = ctx.locale.bind(NS)
+			installNavIcon(ctx, () => t('nav'))
 
 			ctx.slots.inject('settings.section', () =>
 				ctx.slots.register(
