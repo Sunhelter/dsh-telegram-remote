@@ -107,6 +107,11 @@ export function apply(ctx, config) {
   const rowConfig = config ?? {}
   let resolved = resolveConfig(rowConfig)
   const bridge = new Bridge(ctx, resolved)
+  // Agents owned by the Web app live outside this plugin's scope; global
+  // listeners are required to mirror their streams and session events.
+  ctx.on('agent/assistant-stream', (payload) => bridge.onAssistantStream(payload), { global: true })
+  ctx.on('agent/error', (payload) => bridge.onAgentError(payload), { global: true })
+  ctx.on('session/event', (session, event) => bridge.onSessionEvent(session, event), { global: true })
 
   const snapshot = () => ({
     ok: true,

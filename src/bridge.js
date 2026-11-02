@@ -1,10 +1,11 @@
 /**
  * Telegram bridge: long polling, whitelist, offset and session binding.
  *
- * M2 keeps `/sessions`, workspace/session pagination and chat -> session
- * bindings on top of the transport layer; chat and model switching build on the
- * same class. Messages from users outside `allowedUserIds` are dropped.
+ * Serves the bot commands, binds a chat to one session, forwards prompts into
+ * that agent and mirrors the assistant stream, tool activity and elapsed time
+ * back into the chat. Messages from users outside `allowedUserIds` are dropped.
  */
+import { randomUUID } from 'node:crypto'
 import { STATE_PATH, maskToken } from './config.js'
 import { listWorkspaces, sessionView, workspaceView } from './sessions.js'
 import { StateStore } from './state.js'
@@ -20,8 +21,92 @@ const COMMANDS = [
 const PERMISSION_NOTICE_MS = 60_000
 const BACKOFF_START_MS = 1_000
 const BACKOFF_MAX_MS = 30_000
+/** Minimum gap between edits of one streaming Telegram message. */
+const STREAM_EDIT_MS = 1_000
+const STREAM_TAIL = '\n\n…'
+/** How often the live turn status publishes its latest detail and elapsed time. */
+const STATUS_TICK_MS = 1_000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Split text into Telegram-sized parts, preferring paragraph and line breaks. */
+function splitText(text, limit) {
+  if (text.length <= limit) return [text]
+  const parts = []
+  let rest = text
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n\n', limit)
+    if (cut < limit * 0.4) cut = rest.lastIndexOf('\n', limit)
+    if (cut < limit * 0.4) cut = limit
+    parts.push(rest.slice(0, cut).trimEnd())
+    rest = rest.slice(cut).trimStart()
+  }
+  if (rest) parts.push(rest)
+  return parts
+}
+
+/** Human-readable elapsed time, e.g. `1分25秒`. */
+function formatDuration(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 60) return `${seconds}秒`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest ? `${minutes}分${rest}秒` : `${minutes}分`
+  const hours = Math.floor(minutes / 60)
+  const extra = minutes % 60
+  return extra ? `${hours}小时${extra}分` : `${hours}小时`
+}
+
+/** `调用工具：bash、read…` for the tools still running. */
+function toolStatusText(status) {
+  const names = [...new Set(status.pending.values())]
+  if (names.length === 0) return '工具返回，继续思考…'
+  const shown = names.slice(0, 3).join('、')
+  return `调用工具：${shown}${names.length > 3 ? ' 等' : ''}…`
+}
+
+/** One-line error text for Telegram. */
+function errorText(error) {
+  const text = error instanceof Error ? error.message : String(error ?? '未知错误')
+  return text.length > 500 ? `${text.slice(0, 499)}…` : text
+}
+
+/** Same fields `createUserMessage` would mint; we cannot import the factory. */
+function userMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }
+}
+
+/** Busy-Enter preference from the Web settings document; `queue` when unavailable. */
+function busyBehavior(ctx) {
+  try {
+    const form = ctx.get('settings')?.describe?.().find((row) => row.ns === 'ui-conversation')
+    return form?.value?.busyEnter === 'steer' ? 'steer' : 'queue'
+  } catch (error) {
+    ctx.logger?.warn(`telegram-remote: cannot read the busy-enter setting: ${error.message}`)
+    return 'queue'
+  }
+}
+
+/** Default provider/model so a resumed agent can run before a per-session model is picked. */
+function defaultAgentOptions(ctx) {
+  try {
+    const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
+    if (!selection?.provider || !selection?.model) return undefined
+    return {
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+    }
+  } catch (error) {
+    ctx.logger?.warn(`telegram-remote: cannot read the default model: ${error.message}`)
+    return undefined
+  }
+}
 
 const isUnauthorized = (error) => error?.status === 401 || error?.code === 401
 const isConflict = (error) => error?.status === 409 || error?.code === 409
@@ -36,6 +121,10 @@ export class Bridge {
     this.noticeAt = new Map()
     /** Agents resumed by this bridge, keyed by session id; owned by this fiber. */
     this.handles = new Map()
+    /** Live assistant streams mirrored to Telegram, keyed by chat id. */
+    this.streams = new Map()
+    /** Per-chat turn status message (`思考中…` / tool / completed). */
+    this.statuses = new Map()
   }
 
   start() {
@@ -60,6 +149,12 @@ export class Bridge {
     const api = this.api
     this.api = null
     if (api) api.close()
+    for (const stream of this.streams.values()) {
+      if (stream.timer) clearTimeout(stream.timer)
+    }
+    this.streams.clear()
+    for (const status of this.statuses.values()) this.clearStatusTimer(status)
+    this.statuses.clear()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
   }
 
@@ -223,6 +318,8 @@ export class Bridge {
   dropBinding(chatId) {
     const binding = this.state.binding(chatId)
     if (!binding) return null
+    this.abortStream(chatId)
+    this.abortStatus(chatId)
     this.state.clearBinding(chatId)
     try {
       this.state.save()
@@ -246,6 +343,385 @@ export class Bridge {
       return null
     }
     return this.dropBinding(chatId)
+  }
+
+  /** Deliver one text message to the bound session, steering it when running. */
+  async sendPrompt(api, chatId, binding, text) {
+    const agents = this.ctx.get('agents')
+    if (!agents) {
+      await this.reply(api, chatId, '当前部署没有 agents 服务，发不了消息。')
+      return
+    }
+
+    let agent = agents.get(binding.sessionId)
+    if (!agent) {
+      try {
+        const handle = await agents.resume({ resumeSessionId: binding.sessionId, agentOptions: defaultAgentOptions(this.ctx) })
+        this.handles.set(binding.sessionId, handle)
+        agent = handle.agent
+        this.ctx.logger.info(`telegram-remote: resumed ${binding.sessionId} to send a message`)
+      } catch (error) {
+        this.ctx.logger.warn(`telegram-remote: cannot resume ${binding.sessionId}: ${error.message}`)
+        await this.reply(api, chatId, `恢复会话失败：${error.message}`)
+        return
+      }
+    }
+
+    const message = userMessage(text)
+    const behavior = agent.status === 'running' ? busyBehavior(this.ctx) : 'queue'
+    try {
+      if (behavior === 'steer') agent.steer(message)
+      else agent.followup(message)
+    } catch (error) {
+      this.ctx.logger.warn(`telegram-remote: ${behavior} on ${binding.sessionId} failed: ${error.message}`)
+      await this.reply(api, chatId, `发送失败：${error.message}`)
+      return
+    }
+  }
+
+  /** Distribute one live assistant frame to every chat bound to its session. */
+  onAssistantStream(payload) {
+    if (!this.api) return
+    const sessionId = payload?.agent?.session?.id
+    const frame = payload?.frame
+    if (!sessionId || !frame) return
+    for (const chatId of this.chatsBoundTo(sessionId)) {
+      this.applyStreamFrame(chatId, sessionId, frame)
+    }
+  }
+
+  /** Report a terminal turn failure on the chats bound to that session. */
+  onAgentError(payload) {
+    if (!this.api) return
+    const sessionId = payload?.agent?.session?.id
+    if (!sessionId) return
+    const text = `运行出错：${errorText(payload.error)}`
+    for (const chatId of this.chatsBoundTo(sessionId)) {
+      void this.reply(this.api, chatId, text)
+    }
+  }
+
+  /** Map session lifecycle and tool events to the per-chat status message. */
+  onSessionEvent(session, event) {
+    if (!this.api) return
+    const sessionId = session?.id
+    const type = event?.type
+    const data = event?.data
+    if (!sessionId || !type) return
+
+    for (const chatId of this.chatsBoundTo(sessionId)) {
+      if (type === 'turn/start') {
+        this.openStatus(chatId, sessionId, data?.turn)
+        continue
+      }
+
+      const status = this.statuses.get(chatId)
+      if (!status || status.sessionId !== sessionId) continue
+
+      if (type === 'tool/call') {
+        status.phase = 'tool'
+        status.pending.set(data.callId, data.name)
+        this.setDetail(status, toolStatusText(status))
+      } else if (type === 'tool/result') {
+        status.phase = 'thinking'
+        status.pending.delete(data.message?.toolCallId)
+        this.setDetail(status, toolStatusText(status))
+      } else if (type === 'turn/end') {
+        if (data?.turn !== undefined && status.turn !== undefined && data.turn !== status.turn) continue
+        this.closeStatus(chatId, status, data?.reason?.kind)
+      }
+    }
+  }
+
+  /** Start (or reuse) the status message for one chat's current turn. */
+  openStatus(chatId, sessionId, turn) {
+    const current = this.statuses.get(chatId)
+    if (current && current.sessionId === sessionId && current.turn === turn) return current
+    // A missing turn/end must not leak its timer into the next turn.
+    if (current) this.closeStatus(chatId, current, 'unknown')
+
+    const startedAt = Date.now()
+
+    const status = {
+      sessionId,
+      turn,
+      startedAt,
+      messageId: null,
+      sent: '',
+      text: '',
+      target: null,
+      busy: false,
+      pending: new Map(),
+      phase: 'thinking',
+      detail: '思考中…',
+      ticker: null,
+    }
+    this.statuses.set(chatId, status)
+    status.ticker = setInterval(() => {
+      if (this.statuses.get(chatId) === status) this.publishStatus(chatId, status)
+    }, STATUS_TICK_MS)
+    if (typeof status.ticker.unref === 'function') status.ticker.unref()
+    this.publishStatus(chatId, status)
+    return status
+  }
+
+  /** Web-style live header: 深度求索中，用时 12秒：思考中… */
+  renderStatus(status) {
+    return `深度求索中，用时 ${formatDuration(Date.now() - status.startedAt)}：${status.detail}`
+  }
+
+  clearStatusTimer(status) {
+    if (!status.ticker) return
+    clearInterval(status.ticker)
+    status.ticker = null
+  }
+
+  /** Record the latest detail; the status ticker publishes it once per second. */
+  setDetail(status, detail) {
+    status.detail = detail
+  }
+
+  /** Push the current detail and elapsed time to Telegram, coalescing edits. */
+  publishStatus(chatId, status, finalText = null) {
+    const text = finalText ?? this.renderStatus(status)
+    if (text === status.sent || text === status.target) return
+    status.text = text
+    status.target = text
+    void this.flushStatus(chatId, status)
+  }
+
+  async flushStatus(chatId, status) {
+    if (status.busy) return
+    status.busy = true
+    try {
+      while (status.target !== null) {
+        const text = status.target
+        status.target = null
+        if (text === status.sent) continue
+        const api = this.api
+        if (!api) return
+        if (status.messageId === null) {
+          const sent = await api.sendMessage(chatId, text)
+          if (typeof sent?.message_id === 'number') status.messageId = sent.message_id
+        } else {
+          await api.editMessageText(chatId, status.messageId, text)
+        }
+        status.sent = text
+      }
+    } catch (error) {
+      if (!this.api) return
+      if (/message is not modified/i.test(error.message)) {
+        status.sent = status.text
+      } else if (error.code === 429) {
+        // Rate limited: keep the message and retry on the next tick.
+      } else {
+        this.ctx.logger.warn(`telegram-remote: status update for ${chatId} failed: ${error.message}`)
+        status.messageId = null
+        status.sent = ''
+      }
+    } finally {
+      status.busy = false
+      if (status.target !== null) void this.flushStatus(chatId, status)
+    }
+  }
+
+  /** Close the turn with web-style elapsed time. */
+  closeStatus(chatId, status, reason) {
+    this.clearStatusTimer(status)
+    if (this.statuses.get(chatId) === status) this.statuses.delete(chatId)
+    const elapsed = formatDuration(Date.now() - status.startedAt)
+    const label =
+      reason === 'completed'
+        ? '已完成'
+        : reason === 'aborted' || reason === 'interrupted'
+          ? '已中断'
+          : reason === 'error'
+            ? '运行出错'
+            : '已结束'
+    this.publishStatus(chatId, status, `${label}，用时 ${elapsed}`)
+  }
+
+  abortStatus(chatId) {
+    const status = this.statuses.get(chatId)
+    if (!status) return
+    this.clearStatusTimer(status)
+    this.statuses.delete(chatId)
+    status.target = null
+  }
+
+  chatsBoundTo(sessionId) {
+    const chats = []
+    for (const [key, binding] of Object.entries(this.state.data.bindings)) {
+      if (binding?.sessionId === sessionId) chats.push(Number(key))
+    }
+    return chats
+  }
+
+  applyStreamFrame(chatId, sessionId, frame) {
+    const stream = this.streams.get(chatId)
+
+    if (frame.type === 'start') {
+      if (stream) {
+        if (stream.attemptId === frame.attemptId) return
+        this.abortStream(chatId)
+      }
+      this.streams.set(chatId, {
+        sessionId,
+        attemptId: frame.attemptId,
+        text: '',
+        sent: '',
+        messageId: null,
+        lastAt: 0,
+        timer: null,
+        busy: false,
+        dirty: false,
+        ending: false,
+      })
+      return
+    }
+
+    if (frame.type === 'chunk') {
+      // Every publication gets a fresh revision, so only the attempt id is
+      // stable across start/chunk/end.
+      if (!stream || stream.attemptId !== frame.attemptId) return
+      const chunk = frame.chunk
+      if (chunk?.type === 'reasoning-delta') {
+        const status = this.statuses.get(chatId)
+        if (status && status.sessionId === sessionId && status.phase !== 'replying' && status.pending.size === 0) {
+          status.phase = 'thinking'
+          this.setDetail(status, '思考中…')
+        }
+        return
+      }
+      if (chunk?.type !== 'text-delta') return
+      stream.text += chunk.text
+      const status = this.statuses.get(chatId)
+      if (status && status.sessionId === sessionId && status.phase !== 'replying') {
+        status.phase = 'replying'
+        this.setDetail(status, '回复中…')
+      }
+      this.scheduleStream(chatId, stream)
+      return
+    }
+
+    if (frame.type === 'end') {
+      if (!stream || stream.attemptId !== frame.attemptId) return
+      stream.ending = true
+      if (stream.timer) {
+        clearTimeout(stream.timer)
+        stream.timer = null
+      }
+      void this.finalizeStream(chatId, stream, frame.outcome)
+    }
+  }
+
+  scheduleStream(chatId, stream) {
+    if (!this.api || stream.timer || stream.busy || stream.ending) return
+    const wait = Math.max(0, STREAM_EDIT_MS - (Date.now() - stream.lastAt))
+    stream.timer = setTimeout(() => {
+      stream.timer = null
+      void this.flushStream(chatId, stream)
+    }, wait)
+    if (typeof stream.timer.unref === 'function') stream.timer.unref()
+  }
+
+  /** Send the first preview, then edit it at most once per second. */
+  async flushStream(chatId, stream) {
+    if (!this.api || stream.ending) return
+    if (stream.busy) {
+      stream.dirty = true
+      return
+    }
+    const text = this.streamPreview(stream.text)
+    if (!text || text === stream.sent) return
+
+    const api = this.api
+    stream.busy = true
+    try {
+      if (stream.messageId === null) {
+        const sent = await api.sendMessage(chatId, text, { disable_web_page_preview: true })
+        if (typeof sent?.message_id === 'number') stream.messageId = sent.message_id
+      } else {
+        await api.editMessageText(chatId, stream.messageId, text, { disable_web_page_preview: true })
+      }
+      stream.sent = text
+      stream.lastAt = Date.now()
+    } catch (error) {
+      if (this.api !== api) return
+      if (!/message is not modified/i.test(error.message)) {
+        this.ctx.logger.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
+        if (stream.messageId !== null) {
+          stream.messageId = null
+          stream.sent = ''
+        }
+      }
+    } finally {
+      stream.busy = false
+      if (stream.dirty && !stream.ending) {
+        stream.dirty = false
+        this.scheduleStream(chatId, stream)
+      }
+    }
+  }
+
+  streamPreview(text) {
+    const limit = this.messageLimit()
+    if (text.length <= limit) return text
+    return `${text.slice(0, Math.max(1, limit - STREAM_TAIL.length)).trimEnd()}${STREAM_TAIL}`
+  }
+
+  messageLimit() {
+    const configured = Number(this.config.maxMessageLength)
+    return Number.isSafeInteger(configured) && configured > 0 ? configured : 4096
+  }
+
+  /** Commit the final text, splitting it across messages when it overflows. */
+  async finalizeStream(chatId, stream, outcome) {
+    if (stream.timer) {
+      clearTimeout(stream.timer)
+      stream.timer = null
+    }
+    while (stream.busy) await sleep(50)
+    this.streams.delete(chatId)
+
+    const api = this.api
+    if (!api) return
+    const committed = outcome?.kind === 'committed' && outcome.eventType === 'assistant/message'
+    const abandoned = outcome?.kind === 'abandoned'
+    if (!committed && !abandoned) return
+
+    let text = stream.text.trimEnd()
+    if (!text) return
+    if (abandoned) text += '\n\n（已中断）'
+
+    const parts = splitText(text, this.messageLimit())
+    try {
+      if (stream.messageId === null) {
+        for (const part of parts) await api.sendMessage(chatId, part, { disable_web_page_preview: true })
+        return
+      }
+      try {
+        await api.editMessageText(chatId, stream.messageId, parts[0], { disable_web_page_preview: true })
+      } catch (error) {
+        if (!/message is not modified/i.test(error.message)) {
+          for (const part of parts) await api.sendMessage(chatId, part, { disable_web_page_preview: true })
+          return
+        }
+      }
+      for (const part of parts.slice(1)) {
+        await api.sendMessage(chatId, part, { disable_web_page_preview: true })
+      }
+    } catch (error) {
+      if (this.api !== api) return
+      this.ctx.logger.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
+    }
+  }
+
+  abortStream(chatId) {
+    const stream = this.streams.get(chatId)
+    if (!stream) return
+    if (stream.timer) clearTimeout(stream.timer)
+    this.streams.delete(chatId)
   }
 
   /**
@@ -285,7 +761,7 @@ export class Bridge {
 
     if (!agents.get(sessionId)) {
       try {
-        const handle = await agents.resume({ resumeSessionId: sessionId })
+        const handle = await agents.resume({ resumeSessionId: sessionId, agentOptions: defaultAgentOptions(this.ctx) })
         this.handles.set(sessionId, handle)
         this.ctx.logger.info(`telegram-remote: resumed ${sessionId} for chat ${chatId}`)
       } catch (error) {
@@ -297,6 +773,10 @@ export class Bridge {
       }
     }
 
+    if (this.boundSessionId(chatId) !== sessionId) {
+      this.abortStream(chatId)
+      this.abortStatus(chatId)
+    }
     this.state.setBinding(chatId, {
       sessionId,
       title: session.title || '',
@@ -368,7 +848,7 @@ export class Bridge {
       }
       const binding = this.state.binding(chatId)
       if (binding) {
-        await this.reply(api, chatId, `已绑定「${binding.title || '未命名'}」。对话还没接上，先发 /help 看命令。`)
+        await this.sendPrompt(api, chatId, binding, text)
       } else {
         await this.reply(api, chatId, '先发 /sessions 选一个会话。')
       }
@@ -395,7 +875,7 @@ export class Bridge {
       return
     }
     if (command === 'help') {
-      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/unbind 解除绑定\n/help 查看命令')
+      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
       return
     }
     await this.reply(api, chatId, `还不认识 /${command}，发 /help 看现有命令。`)
