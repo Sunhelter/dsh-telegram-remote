@@ -117,6 +117,15 @@ export function apply(ctx, config) {
   ctx.on('agent/assistant-stream', (payload) => bridge.onAssistantStream(payload), { global: true })
   ctx.on('agent/error', (payload) => bridge.onAgentError(payload), { global: true })
   ctx.on('session/event', (session, event) => bridge.onSessionEvent(session, event), { global: true })
+  // ask_user_question: the Web Client claims first while it is open on the
+  // session. With no live Client the forwarded Remote waterfall would hold the
+  // request forever, so this listener has to run before it and take the
+  // question itself.
+  ctx.on(
+    'user-questions/request',
+    (request, next) => bridge.questions.accept(request, next),
+    { global: true, prepend: true },
+  )
 
   const snapshot = () => ({
     ok: true,

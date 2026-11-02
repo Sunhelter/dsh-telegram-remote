@@ -11,6 +11,7 @@ import { STATE_PATH, maskToken } from './config.js'
 import { createLog } from './logbuffer.js'
 import { currentSelection, loadCatalog, modelItems, modelView, selectionFor, selectionLabel } from './models.js'
 import { ReplyOutbox } from './outbox.js'
+import { QuestionHub } from './questions.js'
 import { blankSessionIn, listWorkspaces, sessionView, truncate, workspaceView } from './sessions.js'
 import { StateStore } from './state.js'
 import { TelegramApi } from './telegram.js'
@@ -128,6 +129,8 @@ export class Bridge {
     /** Session -> `{ turn, chats, started }` for a scheduled turn that is
      *  pushed to whitelisted chats which are not bound to its session. */
     this.pushes = new Map()
+    /** `ask_user_question` requests the Web Client did not take. */
+    this.questions = new QuestionHub(this)
   }
 
   start() {
@@ -167,6 +170,7 @@ export class Bridge {
     this.turnStarted.clear()
     this.scheduleTurns.clear()
     this.pushes.clear()
+    this.questions.dispose()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
   }
 
@@ -285,6 +289,12 @@ export class Bridge {
       return
     }
 
+    if (data.startsWith('qa:')) {
+      const handled = await this.questions.onCallback(api, query, chatId, data)
+      if (!handled) await this.answer(api, query.id, '这个按钮已经过期了')
+      return
+    }
+
     if (data === 'b' || data.startsWith('p:')) {
       const page = data === 'b' ? 0 : Number.parseInt(data.slice(2), 10) || 0
       await this.answer(api, query.id)
@@ -358,6 +368,7 @@ export class Bridge {
 
   /** Remove this chat's binding and persist the change; returns the old one. */
   dropBinding(chatId) {
+    this.questions.retire(chatId, '（已解除绑定，问题还留着）')
     const binding = this.state.binding(chatId)
     if (!binding) return null
     this.abortStream(chatId, binding.sessionId)
@@ -566,6 +577,7 @@ export class Bridge {
 
   /** Web-style live header: 深度求索中，用时 12秒：思考中… */
   renderStatus(status) {
+    if (status.phase === 'waiting') return `等待回答，用时 ${formatDuration(Date.now() - status.startedAt)}`
     return `深度求索中，用时 ${formatDuration(Date.now() - status.startedAt)}：${status.detail}`
   }
 
@@ -675,6 +687,14 @@ export class Bridge {
     // Finalize instead of dropping the message, otherwise it stays on screen
     // showing 深度求索中 forever.
     this.closeStatus(chatId, status, 'unknown')
+  }
+
+  /** A question is waiting on this chat's session; say so instead of `思考中`. */
+  noteWaiting(chatId, sessionId) {
+    const status = this.statuses.get(chatId)
+    if (!status || status.sessionId !== sessionId) return
+    status.phase = 'waiting'
+    this.setDetail(status, '等待回答…')
   }
 
   /** Chats whose binding points at this session. */
@@ -953,6 +973,7 @@ export class Bridge {
     if (previous !== sessionId) {
       this.abortStream(chatId, previous)
       this.abortStatus(chatId)
+      this.questions.retire(chatId, '（已切到别的会话）')
     }
     this.state.setBinding(chatId, {
       sessionId,
@@ -966,6 +987,10 @@ export class Bridge {
     } catch (error) {
       this.log.warn(`telegram-remote: cannot save binding: ${error.message}`)
     }
+
+    // A session that is already waiting for an answer opens straight into the
+    // question, like the Web page that replaces its composer with the card.
+    if (await this.questions.show(api, chatId, sessionId)) return
 
     const catalog = (await loadCatalog(this.ctx)).catalog
     const selection = (await currentSelection(this.ctx, sessionId)) ?? catalog?.default ?? null
@@ -1138,13 +1163,14 @@ export class Bridge {
     if (messageId !== undefined) {
       try {
         await api.editMessageText(chatId, messageId, view.text, extra)
-        return
+        return messageId
       } catch (error) {
-        if (this.api !== api) return
-        if (/message is not modified/i.test(error.message)) return
+        if (this.api !== api) return undefined
+        if (/message is not modified/i.test(error.message)) return messageId
       }
     }
-    await this.reply(api, chatId, view.text, extra)
+    const sent = await this.reply(api, chatId, view.text, extra)
+    return typeof sent?.message_id === 'number' ? sent.message_id : undefined
   }
 
   async answer(api, id, text = '') {
@@ -1170,6 +1196,7 @@ export class Bridge {
     const text = typeof message.text === 'string' ? message.text.trim() : ''
     if (!text.startsWith('/')) {
       this.log.info(`收到文本：user ${userId}，chat ${chatId}，${text.length} 字`)
+      if (await this.questions.consumeText(api, chatId, text)) return
       const stale = await this.pruneBinding(chatId)
       if (stale) {
         await this.reply(api, chatId, `之前绑定的「${stale.title || '未命名'}」已经不在了，已解除绑定。发 /sessions 重新选。`)
@@ -1250,10 +1277,11 @@ export class Bridge {
 
   async reply(api, chatId, text, extra = {}) {
     try {
-      await api.sendMessage(chatId, text, extra)
+      return await api.sendMessage(chatId, text, extra)
     } catch (error) {
-      if (this.api !== api) return
+      if (this.api !== api) return undefined
       this.log.warn(`telegram-remote: sendMessage to ${chatId} failed: ${error.message}`)
+      return undefined
     }
   }
 }
