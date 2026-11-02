@@ -3,23 +3,22 @@
 在 Telegram 里遥控电脑上正在跑的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 Web 会话：列会话、附着、切模型、直接对话。
 
-和 `hi-wenw/dsh-telegram-channel` 的区别是只做最小集：不认图片、不接审批，
-界面只有 Telegram 和一个设置页，零依赖、无构建步骤。
-
 ## 状态
 
-M0 骨架、M1 Telegram 传输、M2 会话列表与绑定已完成并真机验证；
-M3 对话、M4 模型切换已真机验证；M5 打磨还没做。
+M0 骨架、M1 Telegram 传输、M2 会话列表与绑定、M3 对话、M4 模型切换、M6 新会话、
+M7 定时唤醒推送都已完成并真机验证；只剩 M5 打磨（/status、日志脱敏）。
 
 ## 用法
 
 在 Web 的「设置 → Telegram 遥控」里填 bot token、允许的用户 ID 和代理，
-保存后立即开始轮询。
+保存后启用。
 
 - `/start` 检查连接
 - `/sessions` 选工作区，再选会话；点会话即绑定
+- `/new` 选工作区，在那个目录新建会话并直接绑定
 - `/model` 切换模型，点一下即生效，和 Web 端同一份选择
 - 直接发文本：发到绑定会话，正文按流式消息回传，长了自动接在下一条，另有一条状态消息显示用时和当前动作
+- 定时任务到期：正文推到白名单用户的 chat（已绑该会话的走绑定），不抢当前绑定；跑完给一个「切到这个会话」按钮
 - `/unbind` 解除绑定
 - `/help` 查看命令
 
@@ -30,14 +29,12 @@ M3 对话、M4 模型切换已真机验证；M5 打磨还没做。
 
 | 键 | 环境变量 | 默认 | 说明 |
 |---|---|---|---|
-| `token` | `DSH_TELEGRAM_TOKEN` | 空 | BotFather 给的 token，空则不启动轮询 |
-| `allowedUserIds` | `DSH_TELEGRAM_ALLOWED_USER_IDS` | `[]` | 数字 user id 白名单，逗号分隔；空表示不限制 |
+| `token` | `DSH_TELEGRAM_TOKEN` | 空 | BotFather 给的 token，空则不启用 |
+| `allowedUserIds` | `DSH_TELEGRAM_ALLOWED_USER_IDS` | `[]` | 数字 user id 白名单，逗号分隔；必填，留空不启用 |
 | `proxy` | `DSH_TELEGRAM_PROXY` | 空 | HTTP CONNECT 代理，如 `http://127.0.0.1:7890` |
 | `pollTimeoutSec` | `DSH_TELEGRAM_POLL_TIMEOUT_SEC` | `30` | getUpdates 长轮询秒数 |
-| `maxMessageLength` | `DSH_TELEGRAM_MAX_MESSAGE_LENGTH` | `4096` | 单条回复的长度上限 |
 
-`api.telegram.org` 在国内直连不通，必须配代理。白名单留空时任何找到这个 bot
-的人都能操作本机，建议始终填上自己的 id。
+bot token 和允许的用户 ID 都有值才会启用。
 
 ## 安装
 

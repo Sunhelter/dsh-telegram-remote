@@ -14,6 +14,10 @@ const FORCE_CUT = 4000
 const PARAGRAPH_SHARE = 0.8
 const SENTENCE_SHARE = 0.9
 const PUNCTUATION_SHARE = 0.95
+// The first message waits for a real sentence: publishing the opening deltas
+// right away shows up as "🐳 \n白名", which reads badly in the chat.
+const FIRST_SEND_CHARS = 60
+const FIRST_SEND_MIN = 6
 
 const SENTENCE_END = /[。！？!?.…]/
 const ANY_PUNCT = /[。！？!?.…，、；：,;:]/
@@ -34,6 +38,12 @@ export function toPlainText(text) {
     .replace(/^#{1,6}\s+/gm, '')
     .replace(/^[ \t]*>[ \t]?/gm, '')
     .replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, '')
+}
+
+/** Whether the first message has enough text to look like a real reply. */
+function firstReady(text) {
+  if (text.length >= FIRST_SEND_CHARS) return true
+  return text.length >= FIRST_SEND_MIN && SENTENCE_END.test(text)
 }
 
 /** First punctuation of `pattern` at or after `floor`, cutting after it. */
@@ -95,6 +105,8 @@ export class ReplyOutbox {
     this.pending = ''
     /** Text already rendered into the open message. */
     this.rendered = ''
+    /** False until the first message exists; leading whitespace is dropped then. */
+    this.started = false
     this.messageId = null
     this.sentText = ''
     this.closed = false
@@ -102,7 +114,8 @@ export class ReplyOutbox {
 
   /** Raw text received so far, cleaned, for tests and callers that need it. */
   get text() {
-    return this.rendered + toPlainText(this.pending)
+    const body = this.rendered + toPlainText(this.pending)
+    return this.started ? body : body.replace(/^\s+/, '')
   }
 
   push(delta) {
@@ -128,7 +141,14 @@ export class ReplyOutbox {
       // arriving while the message is in flight.
       const raw = this.pending
       this.pending = ''
-      const text = this.rendered + toPlainText(raw)
+      let text = this.rendered + toPlainText(raw)
+      if (!this.started) text = text.replace(/^\s+/, '')
+      if (!this.started && !this.closed && !firstReady(text)) {
+        // Nothing has been posted yet: hold the deltas instead of opening a
+        // message with a couple of characters and a stray newline.
+        this.pending = text + this.pending
+        return
+      }
       try {
         const cut = findCut(text, this.limit)
         if (cut <= 0) {
@@ -159,6 +179,7 @@ export class ReplyOutbox {
     if (this.messageId === null) {
       const sent = await this.sendText(body)
       if (typeof sent?.message_id === 'number') this.messageId = sent.message_id
+      this.started = true
       this.sentText = text
       return
     }

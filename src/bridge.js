@@ -3,19 +3,21 @@
  *
  * Serves the bot commands, binds a chat to one session, forwards prompts into
  * that agent and mirrors the assistant stream, tool activity and elapsed time
- * back into the chat. Messages from users outside `allowedUserIds` are dropped.
+ * back into the chat. Messages from users outside `allowedUserIds` are dropped,
+ * and the bot stays off until both a token and at least one allowed id exist.
  */
 import { randomUUID } from 'node:crypto'
 import { STATE_PATH, maskToken } from './config.js'
 import { currentSelection, loadCatalog, modelItems, modelView, selectionFor, selectionLabel } from './models.js'
 import { ReplyOutbox } from './outbox.js'
-import { listWorkspaces, sessionView, workspaceView } from './sessions.js'
+import { blankSessionIn, listWorkspaces, sessionView, truncate, workspaceView } from './sessions.js'
 import { StateStore } from './state.js'
 import { TelegramApi } from './telegram.js'
 
 const COMMANDS = [
   { command: 'start', description: '开始使用' },
   { command: 'sessions', description: '选择工作区和会话' },
+  { command: 'new', description: '在新工作区新建会话' },
   { command: 'model', description: '切换模型' },
   { command: 'unbind', description: '解除会话绑定' },
   { command: 'help', description: '查看命令' },
@@ -108,12 +110,19 @@ export class Bridge {
     this.noticeAt = new Map()
     /** Agents resumed by this bridge, keyed by session id; owned by this fiber. */
     this.handles = new Map()
-    /** Live assistant streams mirrored to Telegram, keyed by chat id. */
+    /** Live assistant streams mirrored to Telegram, keyed by `${chatId}:${sessionId}`. */
     this.streams = new Map()
     /** Per-chat turn status message (`思考中…` / tool / completed). */
     this.statuses = new Map()
     /** Model picker snapshot per chat; callback payloads index into `items`. */
     this.modelMenus = new Map()
+    /** Turn number per session, from `turn/start`. */
+    this.currentTurns = new Map()
+    /** Session -> turn that was started by a scheduled message. */
+    this.scheduleTurns = new Map()
+    /** Session -> `{ turn, chats, started }` for a scheduled turn that is
+     *  pushed to whitelisted chats which are not bound to its session. */
+    this.pushes = new Map()
   }
 
   start() {
@@ -121,6 +130,10 @@ export class Bridge {
 
     if (!this.config.token) {
       this.status = { running: false, bot: null, error: 'missing bot token', offset: this.state.offset }
+      return
+    }
+    if (!Array.isArray(this.config.allowedUserIds) || this.config.allowedUserIds.length === 0) {
+      this.status = { running: false, bot: null, error: 'missing allowed user ids', offset: this.state.offset }
       return
     }
 
@@ -145,6 +158,9 @@ export class Bridge {
     for (const status of this.statuses.values()) this.clearStatusTimer(status)
     this.statuses.clear()
     this.modelMenus.clear()
+    this.currentTurns.clear()
+    this.scheduleTurns.clear()
+    this.pushes.clear()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
   }
 
@@ -270,6 +286,18 @@ export class Bridge {
       return
     }
 
+    if (data === 'n' || data.startsWith('np:')) {
+      const page = data === 'n' ? 0 : Number.parseInt(data.slice(3), 10) || 0
+      await this.answer(api, query.id)
+      await this.showNewWorkspaces(api, chatId, messageId, page)
+      return
+    }
+
+    if (data.startsWith('nw:')) {
+      await this.startNewSession(api, query, chatId, data.slice(3))
+      return
+    }
+
     if (data.startsWith('w:')) {
       const rest = data.slice(2)
       const colon = rest.lastIndexOf(':')
@@ -303,6 +331,12 @@ export class Bridge {
       return
     }
 
+    if (data.startsWith('sw:')) {
+      // Quick switch offered after a scheduled push; only now does binding move.
+      await this.bindSession(api, query, chatId, data.slice(3))
+      return
+    }
+
     if (data.startsWith('s:')) {
       await this.bindSession(api, query, chatId, data.slice(2))
       return
@@ -320,7 +354,7 @@ export class Bridge {
   dropBinding(chatId) {
     const binding = this.state.binding(chatId)
     if (!binding) return null
-    this.abortStream(chatId)
+    this.abortStream(chatId, binding.sessionId)
     this.abortStatus(chatId)
     this.modelMenus.delete(chatId)
     this.state.clearBinding(chatId)
@@ -412,8 +446,19 @@ export class Bridge {
     const data = event?.data
     if (!sessionId || !type) return
 
+    if (type === 'turn/start') {
+      // A push whose turn never closed must not leak into the next turn.
+      this.pushes.delete(sessionId)
+      this.currentTurns.set(sessionId, data?.turn)
+    } else if (type === 'user/message' && data?.source?.kind === 'schedule') {
+      this.noteScheduledTurn(sessionId)
+    }
+
+    const scheduledTurn = this.scheduleTurns.get(sessionId)
     for (const chatId of this.chatsBoundTo(sessionId)) {
-      if (type === 'turn/start') {
+      if (type === 'step/start') {
+        // A scheduled turn only pushes its reply; no 深度求索中 status.
+        if (scheduledTurn !== undefined && scheduledTurn === data?.turn) continue
         this.openStatus(chatId, sessionId, data?.turn)
         continue
       }
@@ -434,6 +479,39 @@ export class Bridge {
         this.closeStatus(chatId, status, data?.reason?.kind)
       }
     }
+
+    if (type === 'turn/end') this.endTurn(sessionId, data?.turn)
+  }
+
+  /** A scheduled message entered the session; remember it and its push targets. */
+  noteScheduledTurn(sessionId) {
+    const turn = this.currentTurns.get(sessionId)
+    if (turn === undefined) return
+    this.scheduleTurns.set(sessionId, turn)
+
+    // Every whitelisted user gets the reply in their private chat (a private
+    // chat id equals its user id). Chats already bound here receive the same
+    // text through the binding path, so they need no extra push.
+    const allowed = Array.isArray(this.config.allowedUserIds) ? this.config.allowedUserIds : []
+    const bound = new Set(this.boundChatsTo(sessionId))
+    const chats = new Set(allowed.filter((id) => Number.isSafeInteger(id) && !bound.has(id)))
+    if (chats.size > 0) this.pushes.set(sessionId, { turn, chats, started: new Set() })
+  }
+
+  /** Drop the turn bookkeeping; each push that never streamed still gets a footer. */
+  endTurn(sessionId, turn) {
+    if (this.currentTurns.get(sessionId) === turn) this.currentTurns.delete(sessionId)
+    if (this.scheduleTurns.get(sessionId) !== turn) return
+    this.scheduleTurns.delete(sessionId)
+
+    const push = this.pushes.get(sessionId)
+    if (!push || push.turn !== turn) return
+    for (const chatId of [...push.chats]) {
+      if (push.started.has(chatId)) continue
+      push.chats.delete(chatId)
+      void this.sendPushFooter(chatId, sessionId)
+    }
+    if (push.chats.size === 0) this.pushes.delete(sessionId)
   }
 
   /** Start (or reuse) the status message for one chat's current turn. */
@@ -450,6 +528,8 @@ export class Bridge {
       turn,
       startedAt,
       messageId: null,
+      ids: [],
+      reclaiming: false,
       sent: '',
       text: '',
       target: null,
@@ -505,11 +585,15 @@ export class Bridge {
         if (!api) return
         if (status.messageId === null) {
           const sent = await api.sendMessage(chatId, text)
-          if (typeof sent?.message_id === 'number') status.messageId = sent.message_id
+          if (typeof sent?.message_id === 'number') {
+            status.messageId = sent.message_id
+            status.ids.push(sent.message_id)
+          }
         } else {
           await api.editMessageText(chatId, status.messageId, text)
         }
         status.sent = text
+        await this.reclaimStatus(chatId, status)
       }
     } catch (error) {
       if (!this.api) return
@@ -525,6 +609,31 @@ export class Bridge {
     } finally {
       status.busy = false
       if (status.target !== null) void this.flushStatus(chatId, status)
+    }
+  }
+
+  /**
+   * When an edit has to be abandoned the replacement is a fresh message; delete
+   * the older ones so each turn keeps exactly one status message.
+   */
+  async reclaimStatus(chatId, status) {
+    const api = this.api
+    if (!api || status.reclaiming || status.ids.length < 2) return
+    status.reclaiming = true
+    try {
+      while (status.ids.length > 1) {
+        const id = status.ids[0]
+        try {
+          await this.api?.deleteMessage?.(chatId, id)
+        } catch (error) {
+          // 400 means it is already gone; anything else (429, network) is
+          // retried on the next flush.
+          if (error?.code !== 400) return
+        }
+        status.ids.shift()
+      }
+    } finally {
+      status.reclaiming = false
     }
   }
 
@@ -547,12 +656,13 @@ export class Bridge {
   abortStatus(chatId) {
     const status = this.statuses.get(chatId)
     if (!status) return
-    this.clearStatusTimer(status)
-    this.statuses.delete(chatId)
-    status.target = null
+    // Finalize instead of dropping the message, otherwise it stays on screen
+    // showing 深度求索中 forever.
+    this.closeStatus(chatId, status, 'unknown')
   }
 
-  chatsBoundTo(sessionId) {
+  /** Chats whose binding points at this session. */
+  boundChatsTo(sessionId) {
     const chats = []
     for (const [key, binding] of Object.entries(this.state.data.bindings)) {
       if (binding?.sessionId === sessionId) chats.push(Number(key))
@@ -560,16 +670,36 @@ export class Bridge {
     return chats
   }
 
+  /** Every chat that should receive this session's live output right now. */
+  chatsBoundTo(sessionId) {
+    const chats = new Set(this.boundChatsTo(sessionId))
+    const push = this.pushes.get(sessionId)
+    if (push) for (const chatId of push.chats) chats.add(chatId)
+    return [...chats]
+  }
+
+  /** Stream key: one chat can mirror two sessions (bound one + scheduled push). */
+  streamKey(chatId, sessionId) {
+    return `${chatId}:${sessionId}`
+  }
+
   applyStreamFrame(chatId, sessionId, frame) {
-    const stream = this.streams.get(chatId)
+    const key = this.streamKey(chatId, sessionId)
+    const stream = this.streams.get(key)
 
     if (frame.type === 'start') {
       if (stream) {
         if (stream.attemptId === frame.attemptId) return
-        this.abortStream(chatId)
+        this.abortStream(chatId, sessionId)
       }
-      this.streams.set(chatId, {
+      const push = this.pushes.get(sessionId)
+      const pushed = Boolean(push && push.chats.has(chatId))
+      if (pushed) push.started.add(chatId)
+      this.streams.set(key, {
+        key,
+        chatId,
         sessionId,
+        pushed,
         attemptId: frame.attemptId,
         outbox: new ReplyOutbox({
           limit: this.messageLimit(),
@@ -677,7 +807,7 @@ export class Bridge {
       stream.timer = null
     }
     while (stream.busy) await sleep(50)
-    this.streams.delete(chatId)
+    this.streams.delete(stream.key)
 
     if (!this.api) return
     const committed = outcome?.kind === 'committed' && outcome.eventType === 'assistant/message'
@@ -689,13 +819,47 @@ export class Bridge {
     } catch (error) {
       this.ctx.logger.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
     }
+    if (stream.pushed) await this.finishPush(stream.sessionId, chatId)
   }
 
-  abortStream(chatId) {
-    const stream = this.streams.get(chatId)
+  abortStream(chatId, sessionId) {
+    if (sessionId == null) return
+    const stream = this.streams.get(this.streamKey(chatId, sessionId))
     if (!stream) return
     if (stream.timer) clearTimeout(stream.timer)
-    this.streams.delete(chatId)
+    this.streams.delete(stream.key)
+  }
+
+  /** A pushed scheduled reply ended for one chat; offer a switch to its session. */
+  async finishPush(sessionId, chatId) {
+    const push = this.pushes.get(sessionId)
+    if (!push || !push.chats.has(chatId)) return
+    push.chats.delete(chatId)
+    await this.sendPushFooter(chatId, sessionId)
+    if (push.chats.size === 0) this.pushes.delete(sessionId)
+  }
+
+  async sendPushFooter(chatId, sessionId) {
+    const api = this.api
+    if (!api) return
+    if (this.boundSessionId(chatId) === sessionId) return
+
+    let title = ''
+    const listed = await listWorkspaces(this.ctx)
+    if (listed.ok) {
+      for (const item of listed.workspaces) {
+        const found = item.sessions.find((candidate) => candidate.id === sessionId)
+        if (found) {
+          title = found.title || ''
+          break
+        }
+      }
+    }
+    const text = title ? `⏰ 定时任务已结束：${truncate(title, 40)}` : '⏰ 定时任务已结束'
+    await this.sendView(api, chatId, undefined, {
+      text,
+      buttons: [[{ text: '切到这个会话', callback_data: `sw:${sessionId}` }]],
+    })
   }
 
   /**
@@ -747,15 +911,29 @@ export class Bridge {
       }
     }
 
-    if (this.boundSessionId(chatId) !== sessionId) {
-      this.abortStream(chatId)
-      this.abortStatus(chatId)
-    }
-    this.state.setBinding(chatId, {
+    await this.applyBinding(api, chatId, query.message?.message_id, {
       sessionId,
       title: session.title || '',
       workspaceId: workspace.id,
       workspaceTitle: workspace.title,
+    })
+  }
+
+  /**
+   * Persist one chat binding and report the session, workspace and model it
+   * points at. Binding a different session drops the old chat's stream/status.
+   */
+  async applyBinding(api, chatId, messageId, { sessionId, title, workspaceId, workspaceTitle, heading = '已绑定' }) {
+    const previous = this.boundSessionId(chatId)
+    if (previous !== sessionId) {
+      this.abortStream(chatId, previous)
+      this.abortStatus(chatId)
+    }
+    this.state.setBinding(chatId, {
+      sessionId,
+      title: title || '',
+      workspaceId,
+      workspaceTitle,
       boundAt: Date.now(),
     })
     try {
@@ -768,9 +946,72 @@ export class Bridge {
     const selection = (await currentSelection(this.ctx, sessionId)) ?? catalog?.default ?? null
     const model = selection ? selectionLabel(selection, catalog) : '未知'
 
-    await this.sendView(api, chatId, query.message?.message_id, {
-      text: `已绑定：${session.title || '未命名'}\n工作区：${workspace.title}\n模型：${model}\n\n/model 切换模型，/unbind 解除绑定。`,
+    await this.sendView(api, chatId, messageId, {
+      text: `${heading}：${title || '未命名'}\n工作区：${workspaceTitle}\n模型：${model}\n\n直接发文本开始对话，/model 切换模型，/unbind 解除绑定。`,
       buttons: [],
+    })
+  }
+
+  /** `/new`: create (or reuse the workspace's blank) session there, then bind it. */
+  async startNewSession(api, query, chatId, workspaceId) {
+    const listed = await listWorkspaces(this.ctx)
+    if (!listed.ok) {
+      await this.answer(api, query.id, '读取工作区失败')
+      await this.reply(api, chatId, listed.error)
+      return
+    }
+
+    const workspace = listed.workspaces.find((item) => item.id === workspaceId)
+    if (!workspace) {
+      await this.answer(api, query.id, '这个工作区已经不在了')
+      return
+    }
+    if (!workspace.path) {
+      await this.answer(api, query.id, '这个工作区没有目录')
+      await this.reply(api, chatId, '这个工作区没有目录路径，建不了会话。')
+      return
+    }
+
+    const controller = this.ctx.get('sessionController')
+    if (typeof controller?.create !== 'function') {
+      await this.answer(api, query.id, '当前部署建不了新会话')
+      await this.reply(api, chatId, '当前部署没有 sessionController.create，建不了新会话。')
+      return
+    }
+
+    // Same path as the Web "+": reuse the workspace's blank session while it is
+    // still blank, otherwise let the Host mint one. `create` attaches the
+    // session to the workspace itself (and throws when that fails).
+    const blank = await blankSessionIn(this.ctx, workspaceId)
+    let created
+    try {
+      created = await controller.create({
+        workspaceId,
+        ...(blank ? { sessionId: blank } : {}),
+      })
+    } catch (error) {
+      this.ctx.logger.warn(`telegram-remote: cannot create a session in ${workspace.path}: ${error.message}`)
+      await this.answer(api, query.id, '新建失败')
+      await this.reply(api, chatId, `新建会话失败：${errorText(error)}`)
+      return
+    }
+
+    const sessionId = created?.sessionId
+    if (!sessionId) {
+      await this.answer(api, query.id, '新建失败')
+      await this.reply(api, chatId, '新建会话失败：宿主没有返回会话。')
+      return
+    }
+
+    this.ctx.logger.info(`telegram-remote: ${sessionId === blank ? 'reused blank' : 'created'} ${sessionId} in ${workspace.path} for chat ${chatId}`)
+
+    await this.answer(api, query.id, '已新建')
+    await this.applyBinding(api, chatId, query.message?.message_id, {
+      sessionId,
+      title: '',
+      workspaceId: workspace.id,
+      workspaceTitle: workspace.title,
+      heading: '已新建并绑定',
     })
   }
 
@@ -853,6 +1094,20 @@ export class Bridge {
     await this.sendView(api, chatId, messageId, workspaceView(result.workspaces, page))
   }
 
+  /** Workspace picker for `/new`; tapping one creates a session in that directory. */
+  async showNewWorkspaces(api, chatId, messageId, page = 0) {
+    const result = await listWorkspaces(this.ctx)
+    if (!result.ok) {
+      await this.reply(api, chatId, result.error)
+      return
+    }
+    await this.sendView(api, chatId, messageId, workspaceView(result.workspaces, page, {
+      action: 'nw',
+      pageAction: 'np',
+      heading: '选择工作区（在这个目录新建会话）',
+    }))
+  }
+
   async sendView(api, chatId, messageId, view) {
     const extra = { reply_markup: { inline_keyboard: view.buttons } }
     if (messageId !== undefined) {
@@ -912,6 +1167,10 @@ export class Bridge {
       await this.showWorkspaces(api, chatId)
       return
     }
+    if (command === 'new') {
+      await this.showNewWorkspaces(api, chatId)
+      return
+    }
     if (command === 'model') {
       await this.showModels(api, chatId, undefined, { page: 0, refresh: true })
       return
@@ -926,7 +1185,7 @@ export class Bridge {
       return
     }
     if (command === 'help') {
-      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/model 切换模型\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
+      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/new 在新工作区新建会话\n/model 切换模型\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
       return
     }
     await this.reply(api, chatId, `还不认识 /${command}，发 /help 看现有命令。`)
@@ -934,7 +1193,7 @@ export class Bridge {
 
   isAllowed(userId) {
     const allowed = this.config.allowedUserIds
-    return !Array.isArray(allowed) || allowed.length === 0 || allowed.includes(userId)
+    return Array.isArray(allowed) && allowed.includes(userId)
   }
 
   async reject(api, chatId) {

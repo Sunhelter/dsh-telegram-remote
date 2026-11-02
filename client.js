@@ -22,26 +22,28 @@ window.__ModuleLoader__.load({
 		const zh = {
 			nav: 'Telegram 遥控',
 			title: 'Telegram 遥控',
-			desc: '在 Telegram 里操作本机 Harness：列会话、切模型、直接对话。填好 bot token 保存后立即开始轮询。',
+			desc: '在 Telegram 里操作本机 Harness：列会话、切模型、直接对话。填好 bot token 和允许的用户 ID，保存后启用。',
 			token: 'Bot Token',
 			tokenPlaceholder: '123456:ABC-DEF…',
 			tokenSaved: '已保存 {token}，留空保持不变',
 			allowed: '允许的用户 ID',
 			allowedPlaceholder: '例如 123456789, 987654321',
-			allowedHint: '留空表示不限制，任何人加上这个 bot 都能操作本机。',
+			allowedHint: '必填，留空不启用。填自己的数字 ID，多个用逗号分隔。',
 			proxy: '代理地址',
 			proxyPlaceholder: 'http://127.0.0.1:7890',
 			proxyHint: 'api.telegram.org 直连不通时需要；留空表示直连。',
 			timeout: '长轮询秒数',
-			save: '保存并启动',
+			save: '保存并启用',
 			saving: '保存中…',
-			saved: '已保存，轮询已按新配置重启',
+			saved: '已保存，已按新配置重新启用',
 			failed: '保存失败：{error}',
 			status: '当前状态',
 			connected: '已连接 {bot}',
-			starting: '已启动，正在连接…',
-			disconnected: '未启动',
-			broken: '启动失败：{error}',
+			starting: '已启用，正在连接…',
+			disconnected: '未启用',
+			needToken: '未启用：还没有 bot token',
+			needAllowed: '未启用：还没有允许的用户 ID',
+			broken: '启用失败：{error}',
 			loading: '正在读取配置…',
 			loadFailed: '读取配置失败：{error}',
 			retry: '重试',
@@ -52,26 +54,28 @@ window.__ModuleLoader__.load({
 		const en = {
 			nav: 'Telegram Remote',
 			title: 'Telegram Remote',
-			desc: 'Drive this Harness from Telegram: list sessions, switch models, chat from your phone. Saving a bot token starts polling right away.',
+			desc: 'Drive this Harness from Telegram: list sessions, switch models, chat from your phone. Fill in a bot token and at least one allowed user ID, then save to enable.',
 			token: 'Bot token',
 			tokenPlaceholder: '123456:ABC-DEF…',
 			tokenSaved: 'Saved {token}; leave empty to keep it',
 			allowed: 'Allowed user IDs',
 			allowedPlaceholder: 'e.g. 123456789, 987654321',
-			allowedHint: 'Leave empty to allow anyone who finds this bot.',
+			allowedHint: 'Required; the bot stays off while this is empty. Comma-separated numeric ids.',
 			proxy: 'Proxy',
 			proxyPlaceholder: 'http://127.0.0.1:7890',
 			proxyHint: 'Needed when api.telegram.org is unreachable directly; empty means direct.',
 			timeout: 'Long-poll seconds',
-			save: 'Save and start',
+			save: 'Save and enable',
 			saving: 'Saving…',
-			saved: 'Saved; polling restarted with the new config',
+			saved: 'Saved; enabled with the new config',
 			failed: 'Save failed: {error}',
 			status: 'Status',
 			connected: 'Connected as {bot}',
-			starting: 'Started, connecting…',
-			disconnected: 'Not running',
-			broken: 'Failed to start: {error}',
+			starting: 'Enabled, connecting…',
+			disconnected: 'Off',
+			needToken: 'Off: no bot token yet',
+			needAllowed: 'Off: no allowed user id yet',
+			broken: 'Failed to enable: {error}',
 			loading: 'Loading config…',
 			loadFailed: 'Cannot load config: {error}',
 			retry: 'Retry',
@@ -223,7 +227,11 @@ window.__ModuleLoader__.load({
 					: failure
 						? t('broken', { error: failure })
 						: t('starting')
-				: t('disconnected')
+				: failure === 'missing bot token'
+					? t('needToken')
+					: failure === 'missing allowed user ids'
+						? t('needAllowed')
+						: t('disconnected')
 
 			const tokenPlaceholder = data?.config.hasToken
 				? t('tokenSaved', { token: data.config.token })

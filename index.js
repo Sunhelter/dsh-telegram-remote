@@ -126,11 +126,15 @@ export function apply(ctx, config) {
   })
 
   ctx.effect(() => {
-    if (resolved.token) {
-      bridge.start()
-    } else {
+    // Both are required: an empty whitelist would otherwise let anyone who
+    // finds the bot drive this machine, so it counts as "not configured".
+    // `start` itself refuses in that case and records why for the settings page.
+    if (!resolved.token) {
       ctx.logger.warn('telegram-remote: no bot token yet; add one in Settings > Telegram 遥控')
+    } else if (resolved.allowedUserIds.length === 0) {
+      ctx.logger.warn('telegram-remote: no allowed user id yet; add one in Settings > Telegram 遥控')
     }
+    bridge.start()
     return () => bridge.stop()
   }, 'telegram-remote: bridge lifecycle')
 

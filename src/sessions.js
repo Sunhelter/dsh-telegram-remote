@@ -107,6 +107,43 @@ export async function listWorkspaces(ctx) {
   return { ok: true, workspaces }
 }
 
+/**
+ * First blank session already attached to one workspace. The Web sidebar reuses
+ * such a row when you open a new conversation instead of minting another empty
+ * session, and `/new` follows the same rule.
+ * @param {object} ctx host context
+ * @param {string} workspaceId workspace to look in
+ * @returns {Promise<string | undefined>} reusable session id
+ */
+export async function blankSessionIn(ctx, workspaceId) {
+  const registry = ctx.get('workspaceRegistry')
+  const workspace = registry?.get?.(workspaceId)
+  const persistence = ctx.get('sessionPersistence')
+  const cache = ctx.get('sessionProjectionCache')
+  if (!workspace || !persistence || !cache) return undefined
+
+  const archived = new Set(registry.archivedSessionIds ?? [])
+  const members = new Set(workspace.sessionIds ?? [])
+  let snapshots
+  try {
+    snapshots = await persistence.list()
+  } catch {
+    return undefined
+  }
+
+  for (const { header } of snapshots) {
+    if (archived.has(header.id) || !members.has(header.id)) continue
+    let metadata
+    try {
+      metadata = cache.cachedSnapshot(header, ['sessionListMetadata'])?.values?.sessionListMetadata
+    } catch {
+      metadata = undefined
+    }
+    if (metadata?.blank === true) return header.id
+  }
+  return undefined
+}
+
 /** Clamp a requested page into range and return its slice start. */
 function pageInfo(total, size, page) {
   const pages = Math.max(1, Math.ceil(total / size))
@@ -115,8 +152,12 @@ function pageInfo(total, size, page) {
   return { pages, current, start: current * size }
 }
 
-/** Workspace keyboard; one workspace per row keeps long titles readable. */
-export function workspaceView(workspaces, page = 0) {
+/**
+ * Workspace keyboard; one workspace per row keeps long titles readable.
+ * `/sessions` and `/new` share it through different callback prefixes, so a tap
+ * either lists that workspace's sessions or starts a new one there.
+ */
+export function workspaceView(workspaces, page = 0, { action = 'w', pageAction = 'p', heading = '选择工作区' } = {}) {
   if (workspaces.length === 0) {
     return { text: '还没有工作区。先在 Web 里新建一个会话。', buttons: [] }
   }
@@ -124,16 +165,16 @@ export function workspaceView(workspaces, page = 0) {
   const { pages, current, start } = pageInfo(workspaces.length, PAGE_SIZE, page)
   const shown = workspaces.slice(start, start + PAGE_SIZE)
   const lines = [pages > 1
-    ? `选择工作区（第 ${current + 1}/${pages} 页，共 ${workspaces.length} 个）：`
-    : '选择工作区：']
+    ? `${heading}（第 ${current + 1}/${pages} 页，共 ${workspaces.length} 个）：`
+    : `${heading}：`]
   const buttons = shown.map((workspace) => [{
     text: truncate(`${workspace.title} (${workspace.sessions.length})`, BUTTON_LIMIT),
-    callback_data: `w:${workspace.id}`,
+    callback_data: `${action}:${workspace.id}`,
   }])
 
   const nav = []
-  if (current > 0) nav.push({ text: '‹ 上一页', callback_data: `p:${current - 1}` })
-  if (current < pages - 1) nav.push({ text: '下一页 ›', callback_data: `p:${current + 1}` })
+  if (current > 0) nav.push({ text: '‹ 上一页', callback_data: `${pageAction}:${current - 1}` })
+  if (current < pages - 1) nav.push({ text: '下一页 ›', callback_data: `${pageAction}:${current + 1}` })
   if (nav.length > 0) buttons.push(nav)
   return { text: lines.join('\n'), buttons }
 }

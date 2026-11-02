@@ -92,6 +92,10 @@ export class TelegramApi {
     return this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, ...extra })
   }
 
+  deleteMessage(chatId, messageId) {
+    return this.call('deleteMessage', { chat_id: chatId, message_id: messageId })
+  }
+
   answerCallbackQuery(callbackQueryId, text) {
     return this.call('answerCallbackQuery', { callback_query_id: callbackQueryId, ...(text ? { text } : {}) })
   }
