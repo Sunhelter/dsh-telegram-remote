@@ -7,6 +7,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { STATE_PATH, maskToken } from './config.js'
+import { currentSelection, loadCatalog, modelItems, modelView, selectionFor, selectionLabel } from './models.js'
 import { listWorkspaces, sessionView, workspaceView } from './sessions.js'
 import { StateStore } from './state.js'
 import { TelegramApi } from './telegram.js'
@@ -14,6 +15,7 @@ import { TelegramApi } from './telegram.js'
 const COMMANDS = [
   { command: 'start', description: '开始使用' },
   { command: 'sessions', description: '选择工作区和会话' },
+  { command: 'model', description: '切换模型' },
   { command: 'unbind', description: '解除会话绑定' },
   { command: 'help', description: '查看命令' },
 ]
@@ -125,6 +127,8 @@ export class Bridge {
     this.streams = new Map()
     /** Per-chat turn status message (`思考中…` / tool / completed). */
     this.statuses = new Map()
+    /** Model picker snapshot per chat; callback payloads index into `items`. */
+    this.modelMenus = new Map()
   }
 
   start() {
@@ -155,6 +159,7 @@ export class Bridge {
     this.streams.clear()
     for (const status of this.statuses.values()) this.clearStatusTimer(status)
     this.statuses.clear()
+    this.modelMenus.clear()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
   }
 
@@ -301,6 +306,18 @@ export class Bridge {
       return
     }
 
+    if (data.startsWith('mp:')) {
+      const page = Number.parseInt(data.slice(3), 10) || 0
+      await this.answer(api, query.id)
+      await this.showModels(api, chatId, messageId, { page, refresh: false })
+      return
+    }
+
+    if (data.startsWith('m:')) {
+      await this.pickModel(api, query, chatId, data.slice(2))
+      return
+    }
+
     if (data.startsWith('s:')) {
       await this.bindSession(api, query, chatId, data.slice(2))
       return
@@ -320,6 +337,7 @@ export class Bridge {
     if (!binding) return null
     this.abortStream(chatId)
     this.abortStatus(chatId)
+    this.modelMenus.delete(chatId)
     this.state.clearBinding(chatId)
     try {
       this.state.save()
@@ -790,8 +808,81 @@ export class Bridge {
       this.ctx.logger.warn(`telegram-remote: cannot save binding: ${error.message}`)
     }
 
+    const catalog = (await loadCatalog(this.ctx)).catalog
+    const selection = (await currentSelection(this.ctx, sessionId)) ?? catalog?.default ?? null
+    const model = selection ? selectionLabel(selection, catalog) : '未知'
+
     await this.sendView(api, chatId, query.message?.message_id, {
-      text: `已绑定：${session.title || '未命名'}\n工作区：${workspace.title}\n\n/unbind 解除绑定。`,
+      text: `已绑定：${session.title || '未命名'}\n工作区：${workspace.title}\n模型：${model}\n\n/model 切换模型，/unbind 解除绑定。`,
+      buttons: [],
+    })
+  }
+
+  /** Render the model picker; `refresh` rebuilds the per-chat callback snapshot. */
+  async showModels(api, chatId, messageId, { page = 0, refresh = true, current: pinned = null } = {}) {
+    const binding = this.state.binding(chatId)
+    if (!binding) {
+      await this.reply(api, chatId, '先发 /sessions 选一个会话。')
+      return
+    }
+
+    let menu = this.modelMenus.get(chatId)
+    if (refresh || !menu) {
+      const loaded = await loadCatalog(this.ctx)
+      if (!loaded.ok) {
+        await this.reply(api, chatId, loaded.error)
+        return
+      }
+      menu = {
+        items: modelItems(loaded.catalog),
+        catalog: loaded.catalog,
+        failures: loaded.catalog.failures ?? [],
+      }
+      this.modelMenus.set(chatId, menu)
+    }
+
+    menu.page = page
+    const current = pinned ?? (await currentSelection(this.ctx, binding.sessionId)) ?? menu.catalog?.default ?? null
+    await this.sendView(api, chatId, messageId, modelView({
+      items: menu.items,
+      page,
+      current,
+      currentLabel: current ? selectionLabel(current, menu.catalog) : '',
+      failures: menu.failures,
+    }))
+  }
+
+  /** Apply one pick from the stored menu snapshot and close the picker. */
+  async pickModel(api, query, chatId, index) {
+    const menu = this.modelMenus.get(chatId)
+    const item = menu?.items?.[Number.parseInt(index, 10)]
+    const binding = this.state.binding(chatId)
+    if (!item || !binding) {
+      await this.answer(api, query.id, '这个菜单已经过期了，重发 /model')
+      return
+    }
+
+    const controller = this.ctx.get('sessionController')
+    if (!controller?.selectModel) {
+      await this.answer(api, query.id, '当前部署切不了模型')
+      return
+    }
+
+    const picked = selectionFor(item)
+    let selected = picked
+    try {
+      const value = await controller.selectModel({ sessionId: binding.sessionId, ...picked })
+      if (value?.selected) selected = value.selected
+    } catch (error) {
+      this.ctx.logger.warn(`telegram-remote: cannot switch model on ${binding.sessionId}: ${error.message}`)
+      await this.answer(api, query.id, `切换失败：${error.message}`)
+      return
+    }
+
+    await this.answer(api, query.id, '已切换')
+    this.modelMenus.delete(chatId)
+    await this.sendView(api, chatId, query.message?.message_id, {
+      text: `已切换模型：${selectionLabel(selected, menu.catalog)}\n\n再发 /model 重新选择。`,
       buttons: [],
     })
   }
@@ -865,6 +956,10 @@ export class Bridge {
       await this.showWorkspaces(api, chatId)
       return
     }
+    if (command === 'model') {
+      await this.showModels(api, chatId, undefined, { page: 0, refresh: true })
+      return
+    }
     if (command === 'unbind') {
       const binding = this.dropBinding(chatId)
       if (!binding) {
@@ -875,7 +970,7 @@ export class Bridge {
       return
     }
     if (command === 'help') {
-      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
+      await this.reply(api, chatId, '可用命令：\n/start 检查连接\n/sessions 选择工作区/会话\n/model 切换模型\n/unbind 解除绑定\n/help 查看命令\n直接发文本：发到你绑定的会话')
       return
     }
     await this.reply(api, chatId, `还不认识 /${command}，发 /help 看现有命令。`)
