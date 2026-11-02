@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Telegram 遥控",
+    "description": "在 Telegram 里操作本机 Harness：列会话、附着、切模型、直接对话。在设置页里填 bot token。"
+  }
+}
