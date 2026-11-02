@@ -8,6 +8,7 @@
 import { randomUUID } from 'node:crypto'
 import { STATE_PATH, maskToken } from './config.js'
 import { currentSelection, loadCatalog, modelItems, modelView, selectionFor, selectionLabel } from './models.js'
+import { ReplyOutbox } from './outbox.js'
 import { listWorkspaces, sessionView, workspaceView } from './sessions.js'
 import { StateStore } from './state.js'
 import { TelegramApi } from './telegram.js'
@@ -25,27 +26,11 @@ const BACKOFF_START_MS = 1_000
 const BACKOFF_MAX_MS = 30_000
 /** Minimum gap between edits of one streaming Telegram message. */
 const STREAM_EDIT_MS = 1_000
-const STREAM_TAIL = '\n\n…'
 /** How often the live turn status publishes its latest detail and elapsed time. */
 const STATUS_TICK_MS = 1_000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** Split text into Telegram-sized parts, preferring paragraph and line breaks. */
-function splitText(text, limit) {
-  if (text.length <= limit) return [text]
-  const parts = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n\n', limit)
-    if (cut < limit * 0.4) cut = rest.lastIndexOf('\n', limit)
-    if (cut < limit * 0.4) cut = limit
-    parts.push(rest.slice(0, cut).trimEnd())
-    rest = rest.slice(cut).trimStart()
-  }
-  if (rest) parts.push(rest)
-  return parts
-}
 
 /** Human-readable elapsed time, e.g. `1分25秒`. */
 function formatDuration(ms) {
@@ -501,7 +486,7 @@ export class Bridge {
 
   /** Push the current detail and elapsed time to Telegram, coalescing edits. */
   publishStatus(chatId, status, finalText = null) {
-    const text = finalText ?? this.renderStatus(status)
+    const text = `🫍 ${finalText ?? this.renderStatus(status)}`
     if (text === status.sent || text === status.target) return
     status.text = text
     status.target = text
@@ -586,9 +571,13 @@ export class Bridge {
       this.streams.set(chatId, {
         sessionId,
         attemptId: frame.attemptId,
-        text: '',
-        sent: '',
-        messageId: null,
+        outbox: new ReplyOutbox({
+          limit: this.messageLimit(),
+          prefix: '🐳 ',
+          sendText: (text) => this.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
+          editText: (messageId, text) => this.api.editMessageText(chatId, messageId, text, { disable_web_page_preview: true }),
+          log: (line) => this.ctx.logger.warn(line),
+        }),
         lastAt: 0,
         timer: null,
         busy: false,
@@ -601,7 +590,9 @@ export class Bridge {
     if (frame.type === 'chunk') {
       // Every publication gets a fresh revision, so only the attempt id is
       // stable across start/chunk/end.
-      if (!stream || stream.attemptId !== frame.attemptId) return
+      if (!stream || stream.attemptId !== frame.attemptId) {
+        return
+      }
       const chunk = frame.chunk
       if (chunk?.type === 'reasoning-delta') {
         const status = this.statuses.get(chatId)
@@ -612,7 +603,7 @@ export class Bridge {
         return
       }
       if (chunk?.type !== 'text-delta') return
-      stream.text += chunk.text
+      stream.outbox.push(chunk.text)
       const status = this.statuses.get(chatId)
       if (status && status.sessionId === sessionId && status.phase !== 'replying') {
         status.phase = 'replying'
@@ -634,7 +625,12 @@ export class Bridge {
   }
 
   scheduleStream(chatId, stream) {
-    if (!this.api || stream.timer || stream.busy || stream.ending) return
+    if (!this.api || stream.ending || stream.timer) return
+    if (stream.busy) {
+      // A slow edit is in flight; flush again as soon as it settles.
+      stream.dirty = true
+      return
+    }
     const wait = Math.max(0, STREAM_EDIT_MS - (Date.now() - stream.lastAt))
     stream.timer = setTimeout(() => {
       stream.timer = null
@@ -643,36 +639,22 @@ export class Bridge {
     if (typeof stream.timer.unref === 'function') stream.timer.unref()
   }
 
-  /** Send the first preview, then edit it at most once per second. */
+  /** Render the open reply message, at most once per `STREAM_EDIT_MS`. */
   async flushStream(chatId, stream) {
-    if (!this.api || stream.ending) return
+    if (!this.api) return
     if (stream.busy) {
       stream.dirty = true
       return
     }
-    const text = this.streamPreview(stream.text)
-    if (!text || text === stream.sent) return
 
     const api = this.api
     stream.busy = true
     try {
-      if (stream.messageId === null) {
-        const sent = await api.sendMessage(chatId, text, { disable_web_page_preview: true })
-        if (typeof sent?.message_id === 'number') stream.messageId = sent.message_id
-      } else {
-        await api.editMessageText(chatId, stream.messageId, text, { disable_web_page_preview: true })
-      }
-      stream.sent = text
+      await stream.outbox.flush()
       stream.lastAt = Date.now()
     } catch (error) {
       if (this.api !== api) return
-      if (!/message is not modified/i.test(error.message)) {
-        this.ctx.logger.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
-        if (stream.messageId !== null) {
-          stream.messageId = null
-          stream.sent = ''
-        }
-      }
+      this.ctx.logger.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
     } finally {
       stream.busy = false
       if (stream.dirty && !stream.ending) {
@@ -682,18 +664,13 @@ export class Bridge {
     }
   }
 
-  streamPreview(text) {
-    const limit = this.messageLimit()
-    if (text.length <= limit) return text
-    return `${text.slice(0, Math.max(1, limit - STREAM_TAIL.length)).trimEnd()}${STREAM_TAIL}`
-  }
-
+  /** Telegram rejects anything past 4096 characters, config included. */
   messageLimit() {
     const configured = Number(this.config.maxMessageLength)
-    return Number.isSafeInteger(configured) && configured > 0 ? configured : 4096
+    return Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 4096) : 4096
   }
 
-  /** Commit the final text, splitting it across messages when it overflows. */
+  /** Finish the reply: let the outbox render whatever is left of the attempt. */
   async finalizeStream(chatId, stream, outcome) {
     if (stream.timer) {
       clearTimeout(stream.timer)
@@ -702,35 +679,14 @@ export class Bridge {
     while (stream.busy) await sleep(50)
     this.streams.delete(chatId)
 
-    const api = this.api
-    if (!api) return
+    if (!this.api) return
     const committed = outcome?.kind === 'committed' && outcome.eventType === 'assistant/message'
     const abandoned = outcome?.kind === 'abandoned'
     if (!committed && !abandoned) return
 
-    let text = stream.text.trimEnd()
-    if (!text) return
-    if (abandoned) text += '\n\n（已中断）'
-
-    const parts = splitText(text, this.messageLimit())
     try {
-      if (stream.messageId === null) {
-        for (const part of parts) await api.sendMessage(chatId, part, { disable_web_page_preview: true })
-        return
-      }
-      try {
-        await api.editMessageText(chatId, stream.messageId, parts[0], { disable_web_page_preview: true })
-      } catch (error) {
-        if (!/message is not modified/i.test(error.message)) {
-          for (const part of parts) await api.sendMessage(chatId, part, { disable_web_page_preview: true })
-          return
-        }
-      }
-      for (const part of parts.slice(1)) {
-        await api.sendMessage(chatId, part, { disable_web_page_preview: true })
-      }
+      await stream.outbox.close(abandoned ? '\n\n（已中断）' : '')
     } catch (error) {
-      if (this.api !== api) return
       this.ctx.logger.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
     }
   }
