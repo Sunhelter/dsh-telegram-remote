@@ -126,6 +126,8 @@ export class Bridge {
     this.turnStarted = new Map()
     /** Session -> turn that was started by a scheduled message. */
     this.scheduleTurns = new Map()
+    /** Session -> turn whose attempt without any target chat was logged. */
+    this.blindLogged = new Map()
     /** Session -> `{ turn, chats, started }` for a scheduled turn that is
      *  pushed to whitelisted chats which are not bound to its session. */
     this.pushes = new Map()
@@ -169,6 +171,7 @@ export class Bridge {
     this.currentTurns.clear()
     this.turnStarted.clear()
     this.scheduleTurns.clear()
+    this.blindLogged.clear()
     this.pushes.clear()
     this.questions.dispose()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
@@ -439,6 +442,20 @@ export class Bridge {
     const sessionId = payload?.agent?.session?.id
     const frame = payload?.frame
     if (!sessionId || !frame) return
+    if (frame.type === 'start') {
+      // Anchor for a scheduled push: which chats this attempt will reach.
+      const push = this.pushes.get(sessionId)
+      if (push) this.log.info(`正文流开始：${sessionId.slice(-8)} → 推送 chat ${[...push.chats].join(',')}`)
+      else if (this.chatsBoundTo(sessionId).length === 0) {
+        // Unbound session (Web page, or a push that was never registered): one
+        // line per turn keeps the log ring from filling up with attempts.
+        const turn = this.currentTurns.get(sessionId) ?? -1
+        if (this.blindLogged.get(sessionId) !== turn) {
+          this.blindLogged.set(sessionId, turn)
+          this.log.info(`正文流开始：${sessionId.slice(-8)} 没有目标 chat（turn ${turn === -1 ? '未知' : turn}）`)
+        }
+      }
+    }
     for (const chatId of this.chatsBoundTo(sessionId)) {
       this.applyStreamFrame(chatId, sessionId, frame)
     }
@@ -512,8 +529,12 @@ export class Bridge {
 
   /** A scheduled message entered the session; remember it and its push targets. */
   noteScheduledTurn(sessionId) {
+    const tag = sessionId.slice(-8)
     const turn = this.currentTurns.get(sessionId)
-    if (turn === undefined) return
+    if (turn === undefined) {
+      this.log.warn(`定时消息：${tag} 没有对应的 turn/start，推送跳过`)
+      return
+    }
     this.scheduleTurns.set(sessionId, turn)
 
     // Every whitelisted user gets the reply in their private chat (a private
@@ -522,7 +543,12 @@ export class Bridge {
     const allowed = Array.isArray(this.config.allowedUserIds) ? this.config.allowedUserIds : []
     const bound = new Set(this.boundChatsTo(sessionId))
     const chats = new Set(allowed.filter((id) => Number.isSafeInteger(id) && !bound.has(id)))
-    if (chats.size > 0) this.pushes.set(sessionId, { turn, chats, started: new Set() })
+    if (chats.size > 0) {
+      this.pushes.set(sessionId, { turn, chats, started: new Set() })
+      this.log.info(`定时消息：${tag} turn ${turn}，推送目标 chat ${[...chats].join(',')}`)
+      return
+    }
+    this.log.info(`定时消息：${tag} turn ${turn}，没有要推送的 chat（白名单都已绑定该会话）`)
   }
 
   /** Drop the turn bookkeeping; each push that never streamed still gets a footer. */
@@ -535,6 +561,7 @@ export class Bridge {
     if (!push || push.turn !== turn) return
     for (const chatId of [...push.chats]) {
       if (push.started.has(chatId)) continue
+      this.log.info(`推送页脚：${sessionId.slice(-8)} → chat ${chatId}（该 chat 没收到正文流）`)
       push.chats.delete(chatId)
       void this.sendPushFooter(chatId, sessionId)
     }
@@ -745,6 +772,7 @@ export class Bridge {
         chatId,
         sessionId,
         pushed,
+        hasToolCall: false,
         attemptId: frame.attemptId,
         outbox: new ReplyOutbox({
           limit: this.messageLimit(),
@@ -769,6 +797,13 @@ export class Bridge {
         return
       }
       const chunk = frame.chunk
+      // The agent loop ends the turn on an assistant message without tool
+      // calls, so a tool-call step is normally intermediate. Keep the
+      // scheduled push target until the text-bearing attempt ends.
+      if (chunk?.type === 'tool-call-delta' || (chunk?.type === 'block-start' && chunk.blockType === 'tool-call')) {
+        stream.hasToolCall = true
+        return
+      }
       if (chunk?.type === 'reasoning-delta') {
         const status = this.statuses.get(chatId)
         if (status && status.sessionId === sessionId && status.phase !== 'replying' && status.pending.size === 0) {
@@ -855,16 +890,26 @@ export class Bridge {
     this.streams.delete(stream.key)
 
     if (!this.api) return
+    const tag = stream.sessionId.slice(-8)
     const committed = outcome?.kind === 'committed' && outcome.eventType === 'assistant/message'
     const abandoned = outcome?.kind === 'abandoned'
-    if (!committed && !abandoned) return
+    if (!committed && !abandoned) {
+      this.log.info(`正文流结束：${tag} → chat ${chatId}，outcome ${outcome?.kind ?? '未知'}/${outcome?.eventType ?? '-'}，不发正文`)
+      return
+    }
+    if (stream.pushed) {
+      const keep = stream.hasToolCall && !abandoned
+      this.log.info(`正文流结束：${tag} → chat ${chatId}，${keep ? '工具调用步骤，保留推送目标' : '收尾发正文'}`)
+    }
 
     try {
       await stream.outbox.close(abandoned ? '\n\n（已中断）' : '')
     } catch (error) {
       this.log.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
     }
-    if (stream.pushed) await this.finishPush(stream.sessionId, chatId)
+    // A tool-call attempt is normally intermediate; only a text-bearing
+    // attempt (or an abandoned run) closes the scheduled push.
+    if (stream.pushed && (!stream.hasToolCall || abandoned)) await this.finishPush(stream.sessionId, chatId)
   }
 
   abortStream(chatId, sessionId) {
@@ -879,6 +924,7 @@ export class Bridge {
   async finishPush(sessionId, chatId) {
     const push = this.pushes.get(sessionId)
     if (!push || !push.chats.has(chatId)) return
+    this.log.info(`推送页脚：${sessionId.slice(-8)} → chat ${chatId}（正文流已结束）`)
     push.chats.delete(chatId)
     await this.sendPushFooter(chatId, sessionId)
     if (push.chats.size === 0) this.pushes.delete(sessionId)

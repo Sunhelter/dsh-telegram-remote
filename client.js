@@ -241,7 +241,7 @@ window.__ModuleLoader__.load({
 			const [logError, setLogError] = React.useState(null)
 			const logSeq = React.useRef(0)
 			const logBox = React.useRef(null)
-			const stickToBottom = React.useRef(true)
+			const stickToTop = React.useRef(true)
 
 			const adopt = React.useCallback((payload) => {
 				setData(payload)
@@ -307,7 +307,7 @@ window.__ModuleLoader__.load({
 
 			React.useEffect(() => {
 				const box = logBox.current
-				if (box && stickToBottom.current) box.scrollTop = box.scrollHeight
+				if (box && stickToTop.current) box.scrollTop = 0
 			}, [logs])
 
 			const clearLogs = () => {
@@ -460,20 +460,22 @@ window.__ModuleLoader__.load({
 							className: 'tg-remote-logbox',
 							ref: logBox,
 							onScroll: (event) => {
-								const box = event.currentTarget
-								stickToBottom.current = box.scrollHeight - box.scrollTop - box.clientHeight < 40
+								stickToTop.current = event.currentTarget.scrollTop < 24
 							},
 						},
 						logs.length === 0
 							? h('div', { className: 'tg-remote-logline' }, t('logEmpty'))
-							: logs.map((entry) =>
-									h(
-										'span',
-										{ key: entry.seq, className: `tg-remote-logline is-${entry.level}` },
-										h('span', { className: 'tg-remote-logtime' }, new Date(entry.at).toLocaleTimeString()),
-										entry.message,
+							: logs
+									.slice()
+									.reverse()
+									.map((entry) =>
+										h(
+											'span',
+											{ key: entry.seq, className: `tg-remote-logline is-${entry.level}` },
+											h('span', { className: 'tg-remote-logtime' }, new Date(entry.at).toLocaleTimeString()),
+											entry.message,
+										),
 									),
-								),
 					),
 				),
 			)

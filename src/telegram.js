@@ -3,6 +3,14 @@ import { request } from './proxy.js'
 
 const PREVIEW_LIMIT = 300
 
+/** Waits between retries of a request that failed before a response arrived. */
+const RETRY_DELAYS_MS = [500, 1500, 4000]
+
+/** Long polling already backs off in the bridge loop; retrying here would stack. */
+const NO_RETRY = new Set(['getUpdates'])
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 /** API error carrying the status, error_code and retry_after the bridge reacts to. */
 export class TelegramError extends Error {
   constructor(message, { method, status = 0, code = 0, retryAfter = 0 } = {}) {
@@ -21,6 +29,7 @@ export class TelegramApi {
     this.proxy = proxy
     this.timeoutMs = timeoutMs
     this.controllers = new Set()
+    this.closed = false
   }
 
   /** Keep the bot token out of anything that may be logged or shown back. */
@@ -30,6 +39,21 @@ export class TelegramApi {
   }
 
   async call(method, params = {}, { timeoutMs = this.timeoutMs } = {}) {
+    const retries = NO_RETRY.has(method) ? 0 : RETRY_DELAYS_MS.length
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.callOnce(method, params, timeoutMs)
+      } catch (error) {
+        // Telegram answered with an error, or the client is shutting down:
+        // another try cannot help.
+        if (error instanceof TelegramError || this.closed || attempt >= retries) throw error
+        await sleep(RETRY_DELAYS_MS[attempt])
+        if (this.closed) throw error
+      }
+    }
+  }
+
+  async callOnce(method, params, timeoutMs) {
     const url = `https://api.telegram.org/bot${this.token}/${method}`
     const controller = new AbortController()
     this.controllers.add(controller)
@@ -80,6 +104,7 @@ export class TelegramApi {
 
   /** Abort every in-flight request; used when the bridge stops or restarts. */
   close() {
+    this.closed = true
     for (const controller of this.controllers) controller.abort()
     this.controllers.clear()
   }
