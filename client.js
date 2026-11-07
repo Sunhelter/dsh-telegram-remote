@@ -20,69 +20,28 @@ window.__ModuleLoader__.load({
 		const CONFIG_PATH = '/plugins/telegram-remote/config'
 		const LOGS_PATH = '/plugins/telegram-remote/logs'
 
-		const NAV_ICON_MARKER = 'data-telegram-remote-nav-icon'
-		const NAV_ROW_SELECTOR = '[role="dialog"] nav button'
-		const NAV_ICON_URL =
-			'data:image/svg+xml,' +
-			encodeURIComponent(
-				'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#000"><g transform="translate(12 12) scale(0.4668) translate(-25.15 -37.9)"><path d="M43.8 20.8 C44.8 20.3 45.8 21.1 45.5 22.2 L39.8 51.9 C39.4 54.1 37.8 54.8 35.9 53.7 L24.1 46.4 C22.6 45.5 22.5 44.2 23.8 43.1 L37.9 29.4 C38.7 28.7 37.8 28.4 37.0 29.0 L16.8 41.7 C15.5 42.5 14.2 42.7 12.7 42.2 L6.6 40.2 C4.8 39.6 4.8 38.4 6.8 37.5 Z"/><circle cx="18" cy="50" r="5.5" fill-opacity="0.5"/></g></svg>',
+		/** Nav glyph: a paper plane with a flight dot, tinted by the current color. */
+		function SectionIcon(props) {
+			const size = props?.size ?? 16
+			return h(
+				'svg',
+				{
+					width: size,
+					height: size,
+					viewBox: '0 0 24 24',
+					fill: 'currentColor',
+					focusable: 'false',
+					'aria-hidden': 'true',
+				},
+				h(
+					'g',
+					{ transform: 'translate(12 12) scale(0.4668) translate(-25.15 -37.9)' },
+					h('path', {
+						d: 'M43.8 20.8 C44.8 20.3 45.8 21.1 45.5 22.2 L39.8 51.9 C39.4 54.1 37.8 54.8 35.9 53.7 L24.1 46.4 C22.6 45.5 22.5 44.2 23.8 43.1 L37.9 29.4 C38.7 28.7 37.8 28.4 37.0 29.0 L16.8 41.7 C15.5 42.5 14.2 42.7 12.7 42.2 L6.6 40.2 C4.8 39.6 4.8 38.4 6.8 37.5 Z',
+					}),
+					h('circle', { cx: 18, cy: 50, r: 5.5, fillOpacity: 0.5 }),
+				),
 			)
-
-		/** Swap the section row's default gear for a paper plane with a dot. */
-		function installNavIcon(ctx, resolveLabel) {
-			if (typeof document === 'undefined') return
-			ctx.effect(() => {
-				const style = document.createElement('style')
-				style.dataset.plugin = 'telegram-remote'
-				style.dataset.pluginCss = 'telegram-remote/settings-nav-icon'
-				style.textContent = [
-					`[${NAV_ICON_MARKER}] > svg { display: none; }`,
-					`[${NAV_ICON_MARKER}]::before {`,
-					`  content: '';`,
-					`  flex: none;`,
-					`  width: 16px;`,
-					`  height: 16px;`,
-					`  background-color: currentColor;`,
-					`  -webkit-mask-image: url("${NAV_ICON_URL}");`,
-					`  mask-image: url("${NAV_ICON_URL}");`,
-					`  -webkit-mask-repeat: no-repeat;`,
-					`  mask-repeat: no-repeat;`,
-					`  -webkit-mask-position: center;`,
-					`  mask-position: center;`,
-					`  -webkit-mask-size: 16px 16px;`,
-					`  mask-size: 16px 16px;`,
-					`}`,
-				].join('\n')
-				document.head.appendChild(style)
-				let disposed = false
-				let scheduled = false
-				const sync = () => {
-					scheduled = false
-					if (disposed) return
-					const wanted = String(resolveLabel() ?? '').trim()
-					if (!wanted) return
-					for (const row of document.querySelectorAll(NAV_ROW_SELECTOR)) {
-						if (row.textContent.trim() === wanted) row.setAttribute(NAV_ICON_MARKER, '')
-						else row.removeAttribute(NAV_ICON_MARKER)
-					}
-				}
-				const schedule = () => {
-					if (scheduled || disposed) return
-					scheduled = true
-					queueMicrotask(sync)
-				}
-				sync()
-				const observer = new MutationObserver(schedule)
-				observer.observe(document.body, { childList: true, subtree: true, characterData: true })
-				return () => {
-					disposed = true
-					observer.disconnect()
-					for (const row of document.querySelectorAll(`[${NAV_ICON_MARKER}]`)) {
-						row.removeAttribute(NAV_ICON_MARKER)
-					}
-					style.remove()
-				}
-			}, 'telegram-remote: settings nav icon')
 		}
 
 		const zh = {
@@ -497,7 +456,18 @@ window.__ModuleLoader__.load({
 			}, 'telegram-remote: styles')
 
 			const t = ctx.locale.bind(NS)
-			installNavIcon(ctx, () => t('nav'))
+
+			ctx.slots.inject('settings.section.icon', () =>
+				ctx.slots.register(
+					{
+						name: 'settings.section.icon',
+						id: 'telegram-remote',
+						order: 40,
+						locale: NS,
+					},
+					(props) => h(SectionIcon, props),
+				),
+			)
 
 			ctx.slots.inject('settings.section', () =>
 				ctx.slots.register(
