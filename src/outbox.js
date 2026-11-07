@@ -187,6 +187,9 @@ export class ReplyOutbox {
       await this.editText(this.messageId, body)
       this.sentText = text
     } catch (error) {
+      // A 429 has to reach the bridge so it can pause this chat; the text is
+      // still in `pending` and the same message is edited again later.
+      if (error?.code === 429) throw error
       if (/message is not modified/i.test(error.message)) {
         this.sentText = text
         return

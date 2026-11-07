@@ -33,6 +33,12 @@ const BACKOFF_MAX_MS = 30_000
 const STREAM_EDIT_MS = 1_000
 /** How often the live turn status publishes its latest detail and elapsed time. */
 const STATUS_TICK_MS = 1_000
+/** Extra wait after a 429 window, so a retry cannot land on its edge. */
+const RATE_LIMIT_MARGIN_MS = 2_000
+/** Pause assumed when Telegram reports a 429 without `retry_after`. */
+const RATE_LIMIT_FALLBACK_SEC = 5
+/** Ceiling for the adaptive edit interval of long turns. */
+const MAX_EDIT_MS = 5_000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -47,6 +53,15 @@ function formatDuration(ms) {
   const hours = Math.floor(minutes / 60)
   const extra = minutes % 60
   return extra ? `${hours}小时${extra}分` : `${hours}小时`
+}
+
+/**
+ * Status edit cadence for one turn: one second, one second slower per elapsed
+ * minute, capped at five seconds. Long turns stop hammering Telegram's limit.
+ */
+function editInterval(startedAt) {
+  const minutes = Math.floor(Math.max(0, Date.now() - startedAt) / 60_000)
+  return Math.min(STREAM_EDIT_MS * (minutes + 1), MAX_EDIT_MS)
 }
 
 /** `调用工具：bash、read…` for the tools still running. */
@@ -131,6 +146,8 @@ export class Bridge {
     /** Session -> `{ turn, chats, started }` for a scheduled turn that is
      *  pushed to whitelisted chats which are not bound to its session. */
     this.pushes = new Map()
+    /** Chat -> epoch ms Telegram asked us to stay quiet until (429). */
+    this.limits = new Map()
     /** `ask_user_question` requests the Web Client did not take. */
     this.questions = new QuestionHub(this)
   }
@@ -173,6 +190,7 @@ export class Bridge {
     this.scheduleTurns.clear()
     this.blindLogged.clear()
     this.pushes.clear()
+    this.limits.clear()
     this.questions.dispose()
     this.status = { running: false, bot: null, error: null, offset: this.state.offset }
   }
@@ -568,6 +586,38 @@ export class Bridge {
     if (push.chats.size === 0) this.pushes.delete(sessionId)
   }
 
+  /** Remember the pause Telegram asked for on a 429; returns the resulting wait. */
+  noteLimit(chatId, error, label = 'call') {
+    const reported = Number(error?.retryAfter)
+    const seconds = reported > 0 ? reported : RATE_LIMIT_FALLBACK_SEC
+    const until = Date.now() + seconds * 1000
+    if (until > (this.limits.get(chatId) ?? 0)) this.limits.set(chatId, until)
+    this.log.warn(`telegram-remote: ${label} 429 on chat ${chatId}, paused ${Math.ceil(seconds)}s`)
+    return this.waitLeft(chatId)
+  }
+
+  /** Milliseconds this chat must stay quiet for; 0 when it is free to use. */
+  waitLeft(chatId) {
+    const until = this.limits.get(chatId)
+    if (!until) return 0
+    const left = until + RATE_LIMIT_MARGIN_MS - Date.now()
+    if (left <= 0) {
+      this.limits.delete(chatId)
+      return 0
+    }
+    return left
+  }
+
+  /** Re-publish a status deferred by a 429 once the chat's window closes. */
+  scheduleStatusRetry(chatId, status, wait) {
+    if (status.retryTimer) return
+    status.retryTimer = setTimeout(() => {
+      status.retryTimer = null
+      void this.flushStatus(chatId, status)
+    }, wait)
+    if (typeof status.retryTimer.unref === 'function') status.retryTimer.unref()
+  }
+
   /** Start (or reuse) the status message for one chat's current turn. */
   openStatus(chatId, sessionId, turn) {
     const current = this.statuses.get(chatId)
@@ -592,10 +642,15 @@ export class Bridge {
       phase: 'thinking',
       detail: '思考中…',
       ticker: null,
+      retryTimer: null,
+      publishedAt: 0,
     }
     this.statuses.set(chatId, status)
     status.ticker = setInterval(() => {
-      if (this.statuses.get(chatId) === status) this.publishStatus(chatId, status)
+      if (this.statuses.get(chatId) !== status) return
+      if (this.waitLeft(chatId) > 0) return
+      if (Date.now() - status.publishedAt < editInterval(status.startedAt)) return
+      this.publishStatus(chatId, status)
     }, STATUS_TICK_MS)
     if (typeof status.ticker.unref === 'function') status.ticker.unref()
     this.publishStatus(chatId, status)
@@ -609,9 +664,14 @@ export class Bridge {
   }
 
   clearStatusTimer(status) {
-    if (!status.ticker) return
-    clearInterval(status.ticker)
-    status.ticker = null
+    if (status.ticker) {
+      clearInterval(status.ticker)
+      status.ticker = null
+    }
+    if (status.retryTimer) {
+      clearTimeout(status.retryTimer)
+      status.retryTimer = null
+    }
   }
 
   /** Record the latest detail; the status ticker publishes it once per second. */
@@ -624,6 +684,14 @@ export class Bridge {
     const text = `🫍 ${finalText ?? this.renderStatus(status)}`
     if (text === status.sent || text === status.target) return
     status.text = text
+    status.publishedAt = Date.now()
+    const wait = this.waitLeft(chatId)
+    if (wait > 0) {
+      // Inside a 429 window: keep the text for the retry timer to publish.
+      status.target = text
+      this.scheduleStatusRetry(chatId, status, wait)
+      return
+    }
     status.target = text
     void this.flushStatus(chatId, status)
   }
@@ -655,7 +723,9 @@ export class Bridge {
       if (/message is not modified/i.test(error.message)) {
         status.sent = status.text
       } else if (error.code === 429) {
-        // Rate limited: keep the message and retry on the next tick.
+        // Rate limited: keep the pending text and publish it once the window closes.
+        status.target = status.text
+        this.scheduleStatusRetry(chatId, status, this.noteLimit(chatId, error, 'status'))
       } else {
         this.log.warn(`telegram-remote: status update for ${chatId} failed: ${error.message}`)
         status.messageId = null
@@ -663,7 +733,7 @@ export class Bridge {
       }
     } finally {
       status.busy = false
-      if (status.target !== null) void this.flushStatus(chatId, status)
+      if (status.target !== null && this.waitLeft(chatId) === 0) void this.flushStatus(chatId, status)
     }
   }
 
@@ -841,7 +911,7 @@ export class Bridge {
       stream.dirty = true
       return
     }
-    const wait = Math.max(0, STREAM_EDIT_MS - (Date.now() - stream.lastAt))
+    const wait = Math.max(0, STREAM_EDIT_MS - (Date.now() - stream.lastAt), this.waitLeft(chatId))
     stream.timer = setTimeout(() => {
       stream.timer = null
       void this.flushStream(chatId, stream)
@@ -857,6 +927,12 @@ export class Bridge {
       return
     }
 
+    if (this.waitLeft(chatId) > 0) {
+      // A timer armed before the 429 landed: wait the window out instead.
+      this.scheduleStream(chatId, stream)
+      return
+    }
+
     const api = this.api
     stream.busy = true
     try {
@@ -864,7 +940,13 @@ export class Bridge {
       stream.lastAt = Date.now()
     } catch (error) {
       if (this.api !== api) return
-      this.log.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
+      if (error.code === 429) {
+        // The outbox kept the text; flush again once the chat's window closes.
+        this.noteLimit(chatId, error, 'streaming')
+        stream.dirty = true
+      } else {
+        this.log.warn(`telegram-remote: streaming to ${chatId} failed: ${error.message}`)
+      }
     } finally {
       stream.busy = false
       if (stream.dirty && !stream.ending) {
@@ -902,14 +984,36 @@ export class Bridge {
       this.log.info(`正文流结束：${tag} → chat ${chatId}，${keep ? '工具调用步骤，保留推送目标' : '收尾发正文'}`)
     }
 
+    // A chat already inside a 429 window must not be written to yet.
+    const wait = this.waitLeft(chatId)
+    if (wait > 0) await sleep(wait)
+    if (!this.api) return
+
     try {
-      await stream.outbox.close(abandoned ? '\n\n（已中断）' : '')
+      await this.closeReply(chatId, stream.outbox, abandoned ? '\n\n（已中断）' : '')
     } catch (error) {
       this.log.warn(`telegram-remote: final reply to ${chatId} failed: ${error.message}`)
     }
     // A tool-call attempt is normally intermediate; only a text-bearing
     // attempt (or an abandoned run) closes the scheduled push.
     if (stream.pushed && (!stream.hasToolCall || abandoned)) await this.finishPush(stream.sessionId, chatId)
+  }
+
+  /**
+   * Deliver the closing text; on a 429 wait out the window and retry once.
+   * `close()` marks the outbox closed, so the retry drains it instead.
+   */
+  async closeReply(chatId, outbox, suffix) {
+    try {
+      await outbox.close(suffix)
+      return
+    } catch (error) {
+      if (error?.code !== 429) throw error
+      const wait = this.noteLimit(chatId, error, 'reply')
+      await sleep(wait)
+      if (!this.api) return
+      await outbox.drain()
+    }
   }
 
   abortStream(chatId, sessionId) {
@@ -1212,6 +1316,10 @@ export class Bridge {
         return messageId
       } catch (error) {
         if (this.api !== api) return undefined
+        if (error.code === 429) {
+          this.noteLimit(chatId, error, 'view')
+          return messageId
+        }
         if (/message is not modified/i.test(error.message)) return messageId
       }
     }
@@ -1326,6 +1434,10 @@ export class Bridge {
       return await api.sendMessage(chatId, text, extra)
     } catch (error) {
       if (this.api !== api) return undefined
+      if (error.code === 429) {
+        this.noteLimit(chatId, error, error.method ?? 'sendMessage')
+        return undefined
+      }
       this.log.warn(`telegram-remote: sendMessage to ${chatId} failed: ${error.message}`)
       return undefined
     }
